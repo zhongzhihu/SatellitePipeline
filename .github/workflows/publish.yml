@@ -22,7 +22,6 @@ jobs:
       SATELLITE_AVIF_QUALITY: "50"
       SATELLITE_RENDER_WORKERS: "4"
       SATELLITE_WCS_DEADLINE_SECONDS: "300"
-      SATELLITE_RUNTIME_DIR: ${{ runner.temp }}/satellite-pipeline
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -37,4 +36,6 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.lock
       - name: Build and publish
+        env:
+          SATELLITE_RUNTIME_DIR: ${{ runner.temp }}/satellite-pipeline
         run: python publish_live.py
