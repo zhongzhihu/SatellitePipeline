@@ -226,8 +226,8 @@ async function abortPackUpload(request, env, id, revision) {
 }
 
 function validateV2Frames(frames) {
-  if (!Array.isArray(frames) || frames.length !== FRAME_LIMIT) {
-    return `Manifest must contain exactly ${FRAME_LIMIT} frames`;
+  if (!Array.isArray(frames) || frames.length < 1 || frames.length > FRAME_LIMIT) {
+    return `Manifest must contain between 1 and ${FRAME_LIMIT} frames`;
   }
   for (const frame of frames) {
     if (!validFrameID(frame?.id) || !validTimestamp(frame?.valid_time) || !validPackRevision(frame?.pack)) {
@@ -240,7 +240,7 @@ function validateV2Frames(frames) {
     }
   }
   const ordered = [...frames].sort((left, right) => Date.parse(left.valid_time) - Date.parse(right.valid_time));
-  if (new Set(ordered.map((frame) => frame.id)).size !== FRAME_LIMIT) return "Frame ids must be unique";
+  if (new Set(ordered.map((frame) => frame.id)).size !== ordered.length) return "Frame ids must be unique";
   if (ordered.some((frame, index) => index > 0 &&
       Date.parse(frame.valid_time) - Date.parse(ordered[index - 1].valid_time) !== 10 * 60 * 1000)) {
     return "Frame times must be consecutive 10-minute steps";

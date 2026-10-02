@@ -2,7 +2,9 @@
 
 Builds packed infrared and visible observation tiles from public NOAA and EUMETSAT feeds, then publishes each frame through a Cloudflare Worker to R2.
 
-The scheduled GitHub Actions workflow runs every ten minutes and can also be started manually. It processes one new frame per run; an empty publication timeline is bootstrapped by the publisher. Scheduled runs may overlap, and the publisher handles frame ownership and publication ordering.
+The scheduled GitHub Actions workflow runs every ten minutes and can also be started manually. It processes one new frame per run. On a cold start, the first valid frame is published immediately; subsequent runs extend the manifest with contiguous frames up to the six-frame limit. During bootstrap, consumers should accept a manifest containing between one and six frames. A shared Actions concurrency group serializes workflow runs, and the publisher also preserves ordering if frame builds overlap.
+
+Each manifest update retains the packs referenced by the current and previous manifests. Other packs are eligible for cleanup after the three-hour retention window, so clients with a briefly cached previous manifest can continue fetching its tiles.
 
 ## GitHub settings
 

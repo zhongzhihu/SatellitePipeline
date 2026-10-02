@@ -197,7 +197,21 @@ def complete_timeline(token: str, target: dt.datetime, deadline: dt.datetime,
             published_ids = [frame["id"] for frame in frames]
             print(f"Published timeline through {window[-1].isoformat()}", flush=True)
             continue
-        missing = missing_frames(target, set(available))
+        if latest is None:
+            missing = missing_frames(target, set(available))
+        else:
+            # Preserve frame continuity after bootstrap. If a newer run finishes
+            # first, wait for the intervening frame instead of advancing past it.
+            steps = max(0, (target - latest) // dt.timedelta(minutes=10))
+            missing = [
+                latest + dt.timedelta(minutes=10 * index)
+                for index in range(1, steps + 1)
+                if latest + dt.timedelta(minutes=10 * index) not in available
+            ]
+        if not missing:
+            # A concurrent publisher has the needed pack(s); poll for its manifest.
+            time.sleep(POLL_SECONDS)
+            continue
         if dt.datetime.now(UTC) >= deadline:
             print(f"Owner of {missing[0].isoformat()} did not publish it; rebuilding", flush=True)
             build(missing[0])
@@ -260,9 +274,7 @@ def main() -> None:
 
     published = read_published_frames(token) if count < MAX_FRAME_COUNT else None
     if published is None and count < MAX_FRAME_COUNT and not explicit_start:
-        # Bootstrap the required timeline when no compatible manifest exists.
-        frame_times = aligned_frame_times(now, MAX_FRAME_COUNT, lag)
-        print("No compatible v2 timeline published; building a six-frame backfill", flush=True)
+        print("No compatible v2 timeline published; the first completed frame will bootstrap it", flush=True)
     rolling = published is not None and not explicit_start
     if rolling and max(published) >= frame_times[-1]:
         print(f"Timeline already reaches {max(published).isoformat()}; nothing to build", flush=True)
@@ -296,8 +308,6 @@ def main() -> None:
     else:
         merged = {**(published or {}), **built}
         frames = [merged[when] for when in sorted(merged)][-MAX_FRAME_COUNT:]
-        if len(frames) < MAX_FRAME_COUNT:
-            raise RuntimeError(f"Need six completed frames before publishing; have {len(frames)}")
         publish_manifest(token, frames, allow_rewind=explicit_start)
         frame_ids = [frame["id"] for frame in frames]
     print(json.dumps({
