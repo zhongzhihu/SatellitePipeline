@@ -11,7 +11,7 @@
     }
   ],
   "vars": {
-    "SATELLITE_CLIENT_AUTH_HEADER": "X-Satellite-Client",
+    "SATELLITE_CLIENT_AUTH_HEADER": "X-Vista-Weather",
     "SATELLITE_STORAGE_PREFIX": "satellite"
   }
 }

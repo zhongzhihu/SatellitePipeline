@@ -380,11 +380,12 @@ def native_objects(when: dt.datetime) -> list[dict]:
     return objects
 
 
-def missing_inputs(when: dt.datetime) -> list[str]:
+def missing_inputs(when: dt.datetime, include_mtg: bool = True) -> list[str]:
     """Primary inputs for ``when`` not yet published (GOES, Himawari, MTG).
 
     Meteosat 0° and IODC are not checked: they scan every 15 minutes and the
-    previous slot is an acceptable fallback.
+    previous slot is an acceptable fallback. MTG may be excluded when finding
+    the newest bootstrap slot because its WCS reader falls back to recent scans.
     """
     missing: list[str] = []
     doy = when.timetuple().tm_yday
@@ -396,15 +397,16 @@ def missing_inputs(when: dt.datetime) -> list[str]:
     for band, resolution in (("B13", "R20"), ("B01", "R10")):
         if sum(f"_{band}_FLDK_{resolution}_" in k for k in keys) < 10:
             missing.append(f"H09 {band}")
-    # FCI scans south to north, so the northern edge of the box arrives last.
-    ir_coverage, vis_coverage, *_ = WCS_SOURCES["MTG"]
-    for coverage in (ir_coverage, vis_coverage):
-        try:
-            wcs_get(coverage, when, (69.9, 70.0), (0.0, 0.1), deadline=time.monotonic() + 30)
-        except WcsMissing:
-            missing.append(f"MTG {coverage}")
-        except Exception:  # EUMETView trouble is handled by the download's own fallbacks
-            pass
+    if include_mtg:
+        # FCI scans south to north, so the northern edge of the box arrives last.
+        ir_coverage, vis_coverage, *_ = WCS_SOURCES["MTG"]
+        for coverage in (ir_coverage, vis_coverage):
+            try:
+                wcs_get(coverage, when, (69.9, 70.0), (0.0, 0.1), deadline=time.monotonic() + 30)
+            except WcsMissing:
+                missing.append(f"MTG {coverage}")
+            except Exception:  # EUMETView trouble is handled by the download's own fallbacks
+                pass
     return missing
 
 

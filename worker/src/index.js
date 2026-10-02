@@ -325,7 +325,7 @@ async function readPublishedV2Manifest(request, env) {
 }
 
 function clientAuthHeader(env) {
-  return (env.SATELLITE_CLIENT_AUTH_HEADER || "X-Satellite-Client").trim();
+  return (env.SATELLITE_CLIENT_AUTH_HEADER || "X-Vista-Weather").trim();
 }
 
 async function clientV2Manifest(request, env) {

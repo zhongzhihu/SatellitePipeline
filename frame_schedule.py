@@ -22,11 +22,6 @@ def missing_frames(target: datetime, available: set[datetime]) -> list[datetime]
     return [when for when in frame_window(target) if when not in available]
 
 
-def fill_deadline(target: datetime, lag_minutes: int, owner_timeout_minutes: int) -> datetime:
-    """Return when the run for ``target`` may take over missing frames."""
-    return target + timedelta(minutes=lag_minutes + owner_timeout_minutes) - FRAME_STEP
-
-
 def publishable_window(available: set[datetime], published_latest: datetime | None) -> list[datetime] | None:
     """Return the newest contiguous window that safely advances the timeline.
 

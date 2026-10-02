@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 
 import mosaic_v2 as mosaic
-from frame_schedule import MAX_FRAME_COUNT, fill_deadline, missing_frames, publishable_window
+from frame_schedule import FRAME_STEP, MAX_FRAME_COUNT, missing_frames, publishable_window
 import pipeline_support as support
 
 UTC = dt.timezone.utc
@@ -23,13 +23,23 @@ WORKER_BASE_URL = ""
 WORKER_USER_AGENT = "SatellitePipelinePublisher/2.0"
 POLL_SECONDS = 30
 MAX_PUBLISH_CONFLICTS = 5
+DEFAULT_BOOTSTRAP_LOOKBACK_MINUTES = 180
 PRODUCT = "Global infrared and visible satellite observations"
 
 
-def aligned_frame_times(now: dt.datetime, count: int, lag_minutes: int) -> list[dt.datetime]:
-    rounded_minute = now.minute - (now.minute % 10)
-    latest = now.replace(minute=rounded_minute, second=0, microsecond=0) - dt.timedelta(minutes=lag_minutes)
-    return [latest - dt.timedelta(minutes=10 * (count - index - 1)) for index in range(count)]
+def latest_available_frame(now: dt.datetime, lookback_minutes: int) -> dt.datetime:
+    """Find the newest ten-minute slot whose native GOES and Himawari inputs are ready."""
+    newest = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
+    for offset in range(0, lookback_minutes + 1, 10):
+        candidate = newest - dt.timedelta(minutes=offset)
+        missing = mosaic.missing_inputs(candidate, include_mtg=False)
+        if not missing:
+            print(f"Newest ready source slot is {candidate.isoformat()}", flush=True)
+            return candidate
+        print(f"Source slot {candidate:%H:%M} is not ready ({', '.join(missing)}); checking the prior slot", flush=True)
+    raise RuntimeError(
+        f"No complete GOES/Himawari source slot found in the last {lookback_minutes} minutes"
+    )
 
 
 class WorkerHTTPError(RuntimeError):
@@ -250,13 +260,17 @@ def main() -> None:
         raise RuntimeError("SATELLITE_PUBLISHER_URL is required")
 
     count = int(os.environ.get("SATELLITE_FRAME_COUNT", "1"))
-    lag = int(os.environ.get("SATELLITE_FRAME_LAG_MINUTES", "10"))
+    bootstrap_lookback = int(os.environ.get(
+        "SATELLITE_BOOTSTRAP_LOOKBACK_MINUTES", str(DEFAULT_BOOTSTRAP_LOOKBACK_MINUTES)
+    ))
     max_wait = int(os.environ.get("SATELLITE_INPUT_WAIT_MINUTES", "10"))
     owner_timeout = int(os.environ.get("SATELLITE_OWNER_TIMEOUT_MINUTES", "20"))
     quality = int(os.environ.get("SATELLITE_AVIF_QUALITY", str(DEFAULT_AVIF_QUALITY)))
     workers = int(os.environ.get("SATELLITE_RENDER_WORKERS", str(max(1, min(8, os.cpu_count() or 4)))))
-    if count < 1 or count > MAX_FRAME_COUNT or lag < 10 or lag % 10:
-        raise ValueError("Frame count must be 1–6 and lag must be a positive 10-minute multiple")
+    if count < 1 or count > MAX_FRAME_COUNT:
+        raise ValueError("SATELLITE_FRAME_COUNT must be between 1 and 6")
+    if bootstrap_lookback < 10 or bootstrap_lookback % 10:
+        raise ValueError("SATELLITE_BOOTSTRAP_LOOKBACK_MINUTES must be a positive 10-minute multiple")
     if max_wait < 0:
         raise ValueError("SATELLITE_INPUT_WAIT_MINUTES must not be negative")
     if owner_timeout < 10:
@@ -265,20 +279,37 @@ def main() -> None:
         raise ValueError("SATELLITE_AVIF_QUALITY must be between 1 and 100")
 
     explicit_start = bool(os.environ.get("SATELLITE_START_UTC"))
+    restart_from_latest = os.environ.get("SATELLITE_RESTART_FROM_LATEST", "").strip().lower() in {
+        "1", "true", "yes",
+    }
     now = dt.datetime.now(UTC)
+    published = read_published_frames(token)
     if explicit_start:
         first = support.parse_utc(os.environ["SATELLITE_START_UTC"])
-        frame_times = [first + dt.timedelta(minutes=10 * index) for index in range(count)]
+        frame_times = [first + FRAME_STEP * index for index in range(count)]
+        bootstrap = False
     else:
-        frame_times = aligned_frame_times(now, count, lag)
+        bootstrap = published is None or restart_from_latest
+        if bootstrap:
+            if restart_from_latest:
+                print("Manual restart: selecting the newest available source frame", flush=True)
+            else:
+                print("No compatible v2 timeline published; selecting the newest available source frame", flush=True)
+            latest = latest_available_frame(now, bootstrap_lookback)
+            previous_latest = max(published, default=None) if published else None
+            if previous_latest is not None and latest <= previous_latest:
+                print(
+                    f"No source frame newer than the published {previous_latest.isoformat()}; "
+                    "keeping the current timeline",
+                    flush=True,
+                )
+                return
+            frame_times = [latest]
+        else:
+            latest_published = max(published)
+            frame_times = [latest_published + FRAME_STEP * index for index in range(1, count + 1)]
 
-    published = read_published_frames(token) if count < MAX_FRAME_COUNT else None
-    if published is None and count < MAX_FRAME_COUNT and not explicit_start:
-        print("No compatible v2 timeline published; the first completed frame will bootstrap it", flush=True)
-    rolling = published is not None and not explicit_start
-    if rolling and max(published) >= frame_times[-1]:
-        print(f"Timeline already reaches {max(published).isoformat()}; nothing to build", flush=True)
-        return
+    rolling = published is not None and not explicit_start and not bootstrap
 
     revision = format(int(time.time()), "x")[-8:]
     output_root = support.RESULTS / "v2-live"
@@ -296,15 +327,21 @@ def main() -> None:
         built[when], size = build_frame(token, when, revision, output_root, quality, workers)
         uploaded_bytes += size
 
-    if not explicit_start:
-        wait_for_inputs(frame_times[-1], frame_times[-1] + dt.timedelta(minutes=lag + max_wait))
+    if rolling:
+        wait_for_inputs(frame_times[-1], dt.datetime.now(UTC) + dt.timedelta(minutes=max_wait))
+    elif explicit_start:
+        wait_for_inputs(frame_times[-1], frame_times[-1] + dt.timedelta(minutes=max_wait))
     for when in frame_times:
         build(when)
 
     if rolling:
-        # Wait for earlier frame owners before rebuilding their frames.
-        deadline = fill_deadline(frame_times[-1], lag + max_wait, owner_timeout)
+        # Wait for another run's frame before attempting to take over its slot.
+        deadline = dt.datetime.now(UTC) + dt.timedelta(minutes=max_wait + owner_timeout)
         frame_ids = complete_timeline(token, frame_times[-1], deadline, built, build)
+    elif bootstrap:
+        frames = [built[frame_times[-1]]]
+        publish_manifest(token, frames)
+        frame_ids = [frame["id"] for frame in frames]
     else:
         merged = {**(published or {}), **built}
         frames = [merged[when] for when in sorted(merged)][-MAX_FRAME_COUNT:]
