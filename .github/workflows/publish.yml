@@ -1,0 +1,40 @@
+name: Publish satellite frames
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SATELLITE_PUBLISHER_URL: ${{ vars.SATELLITE_PUBLISHER_URL }}
+      SATELLITE_PUBLISH_TOKEN: ${{ secrets.SATELLITE_PUBLISH_TOKEN }}
+      SATELLITE_FRAME_COUNT: "1"
+      SATELLITE_FRAME_LAG_MINUTES: "20"
+      SATELLITE_INPUT_WAIT_MINUTES: "10"
+      SATELLITE_OWNER_TIMEOUT_MINUTES: "20"
+      SATELLITE_AVIF_QUALITY: "50"
+      SATELLITE_RENDER_WORKERS: "4"
+      SATELLITE_WCS_DEADLINE_SECONDS: "300"
+      SATELLITE_RUNTIME_DIR: ${{ runner.temp }}/satellite-pipeline
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Check publisher settings
+        run: |
+          test -n "$SATELLITE_PUBLISHER_URL" || { echo "SATELLITE_PUBLISHER_URL variable is required"; exit 1; }
+          test -n "$SATELLITE_PUBLISH_TOKEN" || { echo "SATELLITE_PUBLISH_TOKEN secret is required"; exit 1; }
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.lock
+      - name: Build and publish
+        run: python publish_live.py

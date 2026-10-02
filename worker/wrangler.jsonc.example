@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "satellite-publisher",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-29",
+  "workers_dev": true,
+  "r2_buckets": [
+    {
+      "binding": "SATELLITE_BUCKET",
+      "bucket_name": "replace-with-r2-bucket-name"
+    }
+  ],
+  "vars": {
+    "SATELLITE_CLIENT_AUTH_HEADER": "X-Satellite-Client",
+    "SATELLITE_STORAGE_PREFIX": "satellite"
+  }
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.cache/
+results/
+worker/node_modules/
+worker/.wrangler/
+worker/wrangler.jsonc
+.env
+.env.*
+worker/.dev.vars
