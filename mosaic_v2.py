@@ -149,6 +149,17 @@ def anchor_lut(anchors: tuple[tuple[int, float], ...]) -> np.ndarray:
 
 VIS_GRAY_LUT = reflectance_code(np.arange(256, dtype=np.float32) / 255.0)
 
+# EUMETView's MTG VIS gray index is brighter than the MSG 0-degree VIS index
+# for the same scene. Collocated WCS scans on 2026-10-03 (11:00–12:30 UTC),
+# sampled across Europe, the Atlantic and Africa, gave approximately
+# MSG_gray = 0.86 * MTG_gray - 15. Align MTG to the MSG scale so a frame that
+# falls back to FES and the next frame that recovers MTG keep similar cloud
+# opacity. This is a display calibration of the 8-bit WCS products, not a
+# physical radiance calibration. Zero is WCS nodata and must stay missing.
+_MTG_VIS_GRAY = np.arange(256, dtype=np.float32)
+MTG_VIS_GRAY_LUT = reflectance_code(np.clip((0.86 * _MTG_VIS_GRAY - 15.0) / 255.0, 0.0, 1.0))
+MTG_VIS_GRAY_LUT[0] = 0
+
 
 # --------------------------------------------------------------------------
 # Geometry
@@ -639,6 +650,7 @@ def fetch_wcs_source(
     name: str, when: dt.datetime, deadline: float
 ) -> tuple[NativeLayer | None, NativeLayer | None, dict]:
     ir_coverage, vis_coverage, cadence, *_, vis_scale = WCS_SOURCES[name]
+    vis_lut = MTG_VIS_GRAY_LUT if name == "MTG" else VIS_GRAY_LUT
     started = perf_counter()
     base = when - dt.timedelta(minutes=when.minute % cadence)
     # IR and VIS requests are fetched concurrently.
@@ -647,7 +659,7 @@ def fetch_wcs_source(
         for fallback in range(0, 31, cadence):
             attempt = base - dt.timedelta(minutes=fallback)
             vis_future = pool.submit(
-                fetch_wcs_coverage, name, vis_coverage, attempt, VIS_GRAY_LUT, vis_scale, deadline
+                fetch_wcs_coverage, name, vis_coverage, attempt, vis_lut, vis_scale, deadline
             )
             try:
                 ir = fetch_wcs_coverage(name, ir_coverage, attempt, WCS_IR_LUTS[name], None, deadline)
