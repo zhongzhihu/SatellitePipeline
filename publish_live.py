@@ -24,6 +24,7 @@ WORKER_USER_AGENT = "SatellitePipelinePublisher/2.0"
 POLL_SECONDS = 30
 MAX_PUBLISH_CONFLICTS = 5
 DEFAULT_BOOTSTRAP_LOOKBACK_MINUTES = 180
+MAX_ROLLING_LAG = dt.timedelta(minutes=40)
 PRODUCT = "Global infrared and visible satellite observations"
 
 
@@ -238,7 +239,9 @@ def wait_for_inputs(when: dt.datetime, until: dt.datetime) -> None:
     started = time.perf_counter()
     while True:
         try:
-            missing = mosaic.missing_inputs(when)
+            # MTG has its own fallback during download and must not hold up the
+            # whole pipeline when its optional WCS visible image is unavailable.
+            missing = mosaic.missing_inputs(when, include_mtg=False)
         except Exception as exc:  # listing trouble: wait the full time, as before polling
             missing = [f"input check ({exc})"]
         if not missing:
@@ -307,7 +310,23 @@ def main() -> None:
             frame_times = [latest]
         else:
             latest_published = max(published)
-            frame_times = [latest_published + FRAME_STEP * index for index in range(1, count + 1)]
+            if now - latest_published >= MAX_ROLLING_LAG:
+                # A slow or interrupted chain must catch up instead of spending
+                # hours rebuilding frames that are no longer useful to clients.
+                latest = latest_available_frame(now, bootstrap_lookback)
+                if latest - latest_published > FRAME_STEP:
+                    print(
+                        f"Published timeline lags newest ready source by "
+                        f"{(latest - latest_published).total_seconds() / 60:.0f} minutes; "
+                        f"resuming at {latest.isoformat()}",
+                        flush=True,
+                    )
+                    bootstrap = True
+                    frame_times = [latest]
+                else:
+                    frame_times = [latest_published + FRAME_STEP * index for index in range(1, count + 1)]
+            else:
+                frame_times = [latest_published + FRAME_STEP * index for index in range(1, count + 1)]
 
     rolling = published is not None and not explicit_start and not bootstrap
 

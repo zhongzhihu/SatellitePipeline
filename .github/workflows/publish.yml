@@ -23,6 +23,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    outputs:
+      started_epoch: ${{ steps.start.outputs.epoch }}
     env:
       SATELLITE_PUBLISHER_URL: ${{ vars.SATELLITE_PUBLISHER_URL }}
       SATELLITE_PUBLISH_TOKEN: ${{ secrets.SATELLITE_PUBLISH_TOKEN }}
@@ -35,6 +37,9 @@ jobs:
       SATELLITE_RENDER_WORKERS: "4"
       SATELLITE_WCS_DEADLINE_SECONDS: "300"
     steps:
+      - name: Record run start
+        id: start
+        run: echo "epoch=$(date -u +%s)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
@@ -60,13 +65,15 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Wait for the next 10-minute slot
+      - name: Wait until ten minutes after the previous run started
+        env:
+          PREVIOUS_START_EPOCH: ${{ needs.publish.outputs.started_epoch }}
         run: |
           now_epoch="$(date -u +%s)"
-          next_epoch=$(( ((now_epoch - 180 + 599) / 600) * 600 + 180 ))
+          next_epoch=$(( PREVIOUS_START_EPOCH + 600 ))
           wait_seconds=$(( next_epoch - now_epoch ))
           if (( wait_seconds > 0 )); then
-            echo "Waiting ${wait_seconds}s for the next 10-minute UTC slot."
+            echo "Waiting ${wait_seconds}s to maintain the 10-minute cadence."
             sleep "$wait_seconds"
           fi
 
