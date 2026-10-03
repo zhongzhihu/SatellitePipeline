@@ -513,6 +513,10 @@ class WcsMissing(Exception):
     """The requested coverage time does not exist (yet)."""
 
 
+class WcsIncomplete(WcsMissing):
+    """A coverage has failed chunks and must not enter the satellite mosaic."""
+
+
 def wcs_get(
     coverage: str,
     when: dt.datetime,
@@ -575,7 +579,8 @@ WCS_SOURCES = {
     "IODC": ("msg_iodc__ir108", "msg_iodc__vis006", 15, (-76.98, 76.98), (-35.5, 118.5), None, None),
     "FES": ("msg_fes__ir108", "msg_fes__vis006", 15, (-76.98, 76.98), (-76.98, 76.98), None, None),
 }
-# Missing chunks are left empty so available fallback sources can fill the gap.
+# Incomplete MTG coverages are rejected: filling individual chunks from MSG
+# creates rectangular seams because the products have different radiometry.
 WCS_DEADLINE_SECONDS = float(os.environ.get("SATELLITE_WCS_DEADLINE_SECONDS", "330"))
 WCS_IR_LUTS = {"MTG": anchor_lut(MTG_IR_ANCHORS), "IODC": anchor_lut(IODC_IR_ANCHORS), "FES": anchor_lut(FES_IR_ANCHORS)}
 
@@ -611,13 +616,22 @@ def fetch_wcs_coverage(
         canvas[row:row + h, col:col + w] = lut[gray[:h, :w]]
 
     place(first)
+    failed_boxes = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=WCS_WORKERS) as pool:
-        futures = [pool.submit(wcs_get, coverage, when, box[:2], box[2:], scale, deadline) for box in requests[1:]]
+        futures = {pool.submit(wcs_get, coverage, when, box[:2], box[2:], scale, deadline): box
+                   for box in requests[1:]}
         for future in concurrent.futures.as_completed(futures):
             try:
                 place(decode_geotiff(future.result()))
-            except Exception as exc:  # one failed chunk leaves a hole for other sources
-                print(f"{coverage} chunk failed: {exc}", flush=True)
+            except Exception as exc:
+                box = futures[future]
+                failed_boxes.append(box)
+                print(f"{coverage} chunk {box} failed: {exc}", flush=True)
+    if failed_boxes:
+        raise WcsIncomplete(
+            f"{coverage} {when:%H:%M}: rejected incomplete coverage; "
+            f"{len(failed_boxes)}/{len(requests)} chunks failed: {sorted(failed_boxes)}"
+        )
     return NativeLayer(canvas, None, lon_box[0], lat_box[1], dlon, dlat, clipped_box=True)
 
 
@@ -637,7 +651,8 @@ def fetch_wcs_source(
             )
             try:
                 ir = fetch_wcs_coverage(name, ir_coverage, attempt, WCS_IR_LUTS[name], None, deadline)
-            except WcsMissing:
+            except WcsMissing as exc:
+                print(f"{name} WCS IR unavailable at {attempt:%H:%M}: {exc}", flush=True)
                 vis_future.cancel()
                 concurrent.futures.wait([vis_future])
                 continue
@@ -647,6 +662,11 @@ def fetch_wcs_source(
                 break
             try:
                 vis = vis_future.result()
+            except WcsMissing as exc:
+                # Retry both channels at the same earlier time. Combining a
+                # complete IR scan with partial VIS still produces rectangles.
+                print(f"{name} WCS VIS unavailable at {attempt:%H:%M}: {exc}", flush=True)
+                continue
             except Exception as exc:
                 print(f"{name} WCS VIS unavailable at {attempt:%H:%M}: {exc}", flush=True)
                 vis = None

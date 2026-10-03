@@ -6,11 +6,19 @@ The scheduled GitHub Actions workflow runs every ten minutes and can also be sta
 
 Each manifest update retains the packs referenced by the current and previous manifests. Other packs are eligible for cleanup after the three-hour retention window, so clients with a briefly cached previous manifest can continue fetching its tiles.
 
+## Dawn rendering check
+
+`python3 check_dawn.py` downloads small MTG IR/VIS crops for the six frames from 06:50 through 07:40 UTC on 3 October 2026. It caches inputs and writes before/after images and opacity-change metrics to `results/dawn/`; it does not publish tiles. This optional diagnostic needs Matplotlib in addition to the pipeline's NumPy/Pillow dependencies.
+
+The comparison preserves the old app blend as a baseline and tests the wider 0.10–0.30 solar-cosine transition in VistaWeather's `ForecastMapSatelliteColouriser`. The later transition retains infrared cloud support while visible illumination stabilizes. Lowering the publisher's normalization floor from 0.2 to 0.1 added little improvement in this crop, so the production tile processing remains unchanged. EUMETView supplies 8-bit grayscale imagery without a sufficient published calibration mapping in its coverage metadata; treating gray/255 as reflectance remains an approximation, not a verified physical calibration. These cropped previews isolate MTG and omit satellite fallbacks, the basemap, and AVIF compression.
+
 ## GitHub settings
 
 Set repository variable `SATELLITE_PUBLISHER_URL` to the Worker base URL and secret `SATELLITE_PUBLISH_TOKEN` to its publisher token. The workflow keeps bootstrap lookback, image quality, worker count, and input wait settings in its environment.
 
 Hosted runners start with an empty filesystem. Downloaded source data is cached only during a workflow run, while pip packages use the Actions cache.
+
+MTG is downloaded in 35° chunks. If any chunk fails, the entire channel is rejected and both IR and VIS are retried together at an earlier scan, up to 30 minutes back. If no complete scan is available within the download budget, the other satellites supply coverage. Do not publish partial MTG canvases: filling individual holes from MSG produces rectangular brightness seams between differently calibrated products. Run `python3 -m unittest -v test_wcs_completeness` to check this behavior.
 
 ## Worker
 
