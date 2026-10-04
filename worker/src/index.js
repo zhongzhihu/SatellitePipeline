@@ -52,13 +52,13 @@ function toBase64URL(bytes) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
-function v2Root(env) {
-  const root = (env.SATELLITE_STORAGE_PREFIX || "satellite").replace(/^\/+|\/+$/g, "");
-  return `${root}/v2`;
+function storageKey(env, path) {
+  const prefix = (env.SATELLITE_STORAGE_PREFIX || "").replace(/^\/+|\/+$/g, "");
+  return prefix ? `${prefix}/${path}` : path;
 }
 
 function v2ManifestKey(env) {
-  return `${v2Root(env)}/manifest.json`;
+  return storageKey(env, "manifest.json");
 }
 // 1024 px tiles: tile zoom z draws at map zoom z + 1.
 const V2_TILE_SIZE = 1024;
@@ -92,7 +92,7 @@ function validPackRevision(value) {
 }
 
 function packKey(env, id, revision) {
-  return `${v2Root(env)}/packs/${id}-${revision}.pack`;
+  return storageKey(env, `packs/${id}-${revision}.pack`);
 }
 
 // Tiles in zooms V2_ZOOM_MIN..z-1.
@@ -252,7 +252,7 @@ async function deleteStalePacks(env, keep) {
   const cutoff = Date.now() - PACK_RETENTION_MS;
   let cursor;
   do {
-    const listing = await env.SATELLITE_BUCKET.list({ prefix: `${v2Root(env)}/packs/`, cursor });
+    const listing = await env.SATELLITE_BUCKET.list({ prefix: storageKey(env, "packs/"), cursor });
     const stale = listing.objects
       .filter((object) => !keep.has(object.key) && object.uploaded.getTime() < cutoff)
       .map((object) => object.key);
