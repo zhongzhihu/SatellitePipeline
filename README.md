@@ -10,7 +10,16 @@ Each manifest update retains the packs referenced by the current and previous ma
 
 `python3 check_dawn.py` downloads small MTG IR/VIS crops for the six frames from 06:50 through 07:40 UTC on 3 October 2026. It caches inputs and writes before/after images and opacity-change metrics to `results/dawn/`; it does not publish tiles. This optional diagnostic needs Matplotlib in addition to the pipeline's NumPy/Pillow dependencies.
 
-The comparison preserves the old app blend as a baseline and tests the wider 0.10–0.30 solar-cosine transition in VistaWeather's `ForecastMapSatelliteColouriser`. The later transition retains infrared cloud support while visible illumination stabilizes. Lowering the publisher's normalization floor from 0.2 to 0.1 added little improvement in this crop, so the production tile processing remains unchanged. EUMETView supplies 8-bit grayscale imagery without a sufficient published calibration mapping in its coverage metadata; treating gray/255 as reflectance remains an approximation, not a verified physical calibration. These cropped previews isolate MTG and omit satellite fallbacks, the basemap, and AVIF compression.
+"Before" reproduces the settings behind the 4 October 2026 screenshots, where scrubbing 10 minutes visibly brightened clouds west of Europe. "After" uses the current publisher and app code. Low-sun visible imagery stays steady between frames because of four changes:
+
+- MTG gray is decoded through its measured gamma-like transfer to the FES scale (see `MTG_VIS_GRAY_LUT`).
+- Each source's reflectance is normalised by the sun at that source's actual slot, including fallbacks, plus the per-pixel scan offset (`scan_offset_minutes`).
+- The normalisation floor is cos(sza) 0.08.
+- Low-sun haze is subtracted without re-stretching.
+
+In the app, visible imagery eases in over cos(sza) 0.05 to min(0.45, 0.8 × noon cos), so winter high latitudes still reach the full daytime look.
+
+EUMETView supplies 8-bit grayscale imagery without a published calibration. Treating FES gray/255 as reflectance is an approximation. The previews isolate MTG and omit satellite fallbacks, the basemap and AVIF compression.
 
 ## GitHub settings
 
@@ -20,7 +29,7 @@ Hosted runners start with an empty filesystem. Downloaded source data is cached 
 
 MTG is downloaded in 35° chunks. If any chunk fails, the entire channel is rejected and both IR and VIS are retried together at an earlier scan, up to 30 minutes back. If no complete scan is available within the download budget, the other satellites supply coverage. Do not publish partial MTG canvases: filling individual holes from MSG produces rectangular brightness seams between differently calibrated products. Run `python3 -m unittest -v test_wcs_completeness` to check this behavior.
 
-The MTG visible WCS gray index is aligned to the Meteosat 0° (FES) gray index before reflectance encoding. Matching 3 October 2026 scans over Europe, the Atlantic, and Africa gave an approximate mapping of `FES gray = 0.86 × MTG gray − 15`. This display-level correction reduces the brightness jump when an incomplete MTG scan falls back to FES and the next frame returns to MTG. It does not change the infrared data or claim a physical radiance calibration.
+The MTG visible WCS gray index is mapped to the Meteosat 0° (FES) gray index before reflectance encoding. EUMETView's MTG product is gamma-encoded and FES is linear. The table in `mosaic_v2.py` holds medians of collocated scans from 3–4 October 2026, over Europe, the Atlantic and Africa, and is close to FES ≈ 0.105 × MTG^1.406. This keeps FES fallback frames and MTG frames at matching brightness, and keeps MTG dawn clouds from brightening faster than the sun. It is a display calibration, not a physical radiance calibration.
 
 ## Worker
 

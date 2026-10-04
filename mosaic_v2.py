@@ -36,7 +36,7 @@ WORLD_PX = TILE_SIZE << MAX_ZOOM
 IR_WARM_K = 321.25
 IR_COLD_K = 182.75
 IR_STEP_K = (IR_WARM_K - IR_COLD_K) / 254.0
-VIS_NORMALISATION_FLOOR = 0.2  # cos(sza) floor for reflectance normalisation
+VIS_NORMALISATION_FLOOR = 0.08  # cos(sza) floor for reflectance normalisation
 NIGHT_COS_SZA = math.cos(math.radians(89.0))
 BLUE_OFFSET = 0.08  # Rayleigh path radiance in 0.47 µm vs 0.64 µm reflectance
 BLUE_GAIN = 0.92
@@ -149,16 +149,35 @@ def anchor_lut(anchors: tuple[tuple[int, float], ...]) -> np.ndarray:
 
 VIS_GRAY_LUT = reflectance_code(np.arange(256, dtype=np.float32) / 255.0)
 
-# EUMETView's MTG VIS gray index is brighter than the MSG 0-degree VIS index
-# for the same scene. Collocated WCS scans on 2026-10-03 (11:00–12:30 UTC),
-# sampled across Europe, the Atlantic and Africa, gave approximately
-# MSG_gray = 0.86 * MTG_gray - 15. Align MTG to the MSG scale so a frame that
-# falls back to FES and the next frame that recovers MTG keep similar cloud
-# opacity. This is a display calibration of the 8-bit WCS products, not a
-# physical radiance calibration. Zero is WCS nodata and must stay missing.
-_MTG_VIS_GRAY = np.arange(256, dtype=np.float32)
-MTG_VIS_GRAY_LUT = reflectance_code(np.clip((0.86 * _MTG_VIS_GRAY - 15.0) / 255.0, 0.0, 1.0))
-MTG_VIS_GRAY_LUT[0] = 0
+# EUMETView's MSG vis006 gray is linear in reflectance, but its MTG vis06_hrfi
+# gray is gamma-encoded: dark scenes are lifted and the curve is not a
+# straight line. Median collocated MSG 0° gray per MTG gray bin, from WCS scans
+# on 2026-10-03 (09:00, 12:00 UTC) and 2026-10-04 (08:00, 08:30 UTC) across
+# Europe, the Atlantic and Africa. Below the table the transfer is taken as
+# proportional; above it the fitted power law FES ≈ 0.105·MTG^1.406 continues
+# from the last point. Decoding MTG with a linear map instead made dawn
+# clouds brighten far faster than the sun, and made MTG and MSG frames differ
+# by up to 30 gray levels. Zero is WCS nodata and must stay missing.
+_MTG_TRANSFER_GRAY = np.arange(23, 204, 6, dtype=np.float64)
+_MTG_TRANSFER_FES = np.array([
+    9.8, 12.9, 16.2, 19.5, 22.7, 26.1, 29.5, 33.2, 37.7, 43.4, 49.5, 56.0, 63.1, 70.3, 77.5, 84.3,
+    90.0, 95.8, 101.2, 106.9, 112.8, 118.9, 125.9, 133.3, 141.5, 147.8, 157.7, 164.5, 172.6, 178.4, 187.1,
+])
+
+
+def _mtg_vis_gray_lut() -> np.ndarray:
+    gray = np.arange(256, dtype=np.float64)
+    fes = np.interp(gray, _MTG_TRANSFER_GRAY, _MTG_TRANSFER_FES)
+    low = gray < _MTG_TRANSFER_GRAY[0]
+    fes[low] = gray[low] * _MTG_TRANSFER_FES[0] / _MTG_TRANSFER_GRAY[0]
+    high = gray > _MTG_TRANSFER_GRAY[-1]
+    fes[high] = _MTG_TRANSFER_FES[-1] * (gray[high] / _MTG_TRANSFER_GRAY[-1]) ** 1.406
+    lut = reflectance_code(np.clip(fes / 255.0, 0.0, 1.0).astype(np.float32))
+    lut[0] = 0
+    return lut
+
+
+MTG_VIS_GRAY_LUT = _mtg_vis_gray_lut()
 
 
 # --------------------------------------------------------------------------
@@ -170,8 +189,8 @@ def smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
-def cos_solar_zenith(longitude: np.ndarray, latitude: np.ndarray, when: dt.datetime) -> np.ndarray:
-    """NOAA low-precision solar position (≈0.1°), used for day/night blending."""
+def solar_terms(when: dt.datetime) -> tuple[float, float, float]:
+    """(declination in radians, equation of time in minutes, UTC hours)."""
     when = when.astimezone(UTC)
     hours = when.hour + when.minute / 60.0 + when.second / 3600.0
     gamma = 2.0 * math.pi / 365.0 * (when.timetuple().tm_yday - 1 + (hours - 12.0) / 24.0)
@@ -184,11 +203,47 @@ def cos_solar_zenith(longitude: np.ndarray, latitude: np.ndarray, when: dt.datet
         0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
         - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma)
     )
-    true_solar_minutes = hours * 60.0 + equation_of_time + 4.0 * np.asarray(longitude, dtype=np.float64)
+    return declination, equation_of_time, hours
+
+
+def cos_solar_zenith(
+    longitude: np.ndarray, latitude: np.ndarray, when: dt.datetime, minutes: np.ndarray | float = 0.0,
+) -> np.ndarray:
+    """NOAA low-precision solar position (≈0.1°), used for day/night blending.
+
+    ``minutes`` optionally shifts the time per pixel, e.g. the scan offset.
+    """
+    declination, equation_of_time, hours = solar_terms(when)
+    true_solar_minutes = (hours * 60.0 + equation_of_time + np.asarray(minutes, dtype=np.float64)
+                          + 4.0 * np.asarray(longitude, dtype=np.float64))
     hour_angle = np.deg2rad(true_solar_minutes / 4.0 - 180.0)
     lat = np.deg2rad(np.asarray(latitude, dtype=np.float64))
     value = np.sin(lat) * math.sin(declination) + np.cos(lat) * math.cos(declination) * np.cos(hour_angle)
     return value.astype(np.float32)
+
+
+# Full-disk scan duration (minutes) and direction. FCI and SEVIRI scan from
+# south to north, ABI and AHI from north to south. Durations are approximate;
+# the error they leave is far below the 10-minute frame step.
+SCAN_TIMING = {
+    "MTG": (8.3, True), "FES": (12.0, True), "IODC": (12.0, True),
+    "G18": (9.5, False), "G19": (9.5, False), "H09": (9.5, False),
+}
+
+
+def scan_offset_minutes(longitude: np.ndarray, latitude: np.ndarray, satellite_lon: float, name: str) -> np.ndarray:
+    """Minutes after the nominal scan start at which each pixel was imaged.
+
+    Uses the north–south scan angle seen from the satellite (±8.9° spans the
+    disk); off-disk pixels clamp to the scan's ends.
+    """
+    duration, south_to_north = SCAN_TIMING[name]
+    radius, orbit = 6378.137, 42164.0
+    lat = np.deg2rad(np.asarray(latitude, dtype=np.float64))
+    delta_lon = np.deg2rad(np.asarray(longitude, dtype=np.float64) - satellite_lon)
+    elevation = np.degrees(np.arctan2(radius * np.sin(lat), orbit - radius * np.cos(lat) * np.cos(delta_lon)))
+    fraction = (elevation + 8.9) / 17.8 if south_to_north else (8.9 - elevation) / 17.8
+    return np.clip(fraction, 0.0, 1.0) * duration
 
 
 def view_cosine(longitude: np.ndarray, latitude: np.ndarray, satellite_lon: float) -> np.ndarray:
@@ -326,6 +381,9 @@ class Source:
     vis: NativeLayer | None = None
     vis_is_blue: bool = False
     info: dict = dataclasses.field(default_factory=dict)
+    # Nominal scan start actually used (WCS sources may fall back to earlier
+    # slots); visible reflectance is normalised by the sun at this time.
+    time: dt.datetime | None = None
 
 
 def bilinear_sample(codes: np.ndarray, row: np.ndarray, col: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -713,10 +771,10 @@ def acquire_sources(when: dt.datetime, include_wcs: bool = True) -> list[Source]
 
     layers = load_native_layers(when)
     sources = [
-        Source(sat, {"G18": "GOES-18", "G19": "GOES-19"}[sat], lon, 0.0, vis_is_blue=True)
+        Source(sat, {"G18": "GOES-18", "G19": "GOES-19"}[sat], lon, 0.0, vis_is_blue=True, time=when)
         for sat, (_, lon) in GOES_SATELLITES.items()
     ]
-    sources.append(Source("H09", "Himawari-9", HIMAWARI[1], 0.0, vis_is_blue=True))
+    sources.append(Source("H09", "Himawari-9", HIMAWARI[1], 0.0, vis_is_blue=True, time=when))
     by_name = {source.name: source for source in sources}
     for (sat, channel), (layer, info) in layers.items():
         kind = NATIVE_CHANNELS[(sat, channel)][1]
@@ -731,7 +789,9 @@ def acquire_sources(when: dt.datetime, include_wcs: bool = True) -> list[Source]
         if name not in wcs_results:
             continue
         ir, vis, info = wcs_results[name]
-        sources.append(Source(name, label, lon, penalty, ir=ir, vis=vis, info=info))
+        scan_time = (dt.datetime.strptime(info["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+                     if "timestamp" in info else when)
+        sources.append(Source(name, label, lon, penalty, ir=ir, vis=vis, info=info, time=scan_time))
     return sources
 
 
@@ -787,8 +847,6 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
         scores.append((source, cos_pixels + source.penalty, smoothstep(*LIMB_FADE, cos_pixels)))
     best = np.max(np.stack([score for _, score, _ in scores]), axis=0)
 
-    cos_sun = _upsample(cos_solar_zenith(lon_grid, lat_grid, _WHEN))
-    day = cos_sun > NIGHT_COS_SZA
     sums = {"ir": [np.zeros(shape, np.float32), np.zeros(shape, np.float32)],
             "vis": [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]}
     for source, score, fade in scores:
@@ -800,9 +858,19 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
             layer: NativeLayer | None = getattr(source, kind)
             if layer is None:
                 continue
-            # Sample only pixels this source can affect; visible is zeroed at
-            # night below, so skip it there too.
-            mask = active & day if kind == "vis" else active
+            # Sample only pixels this source can affect. Visible reflectance is
+            # normalised by the sun when this source imaged each pixel (its
+            # actual slot plus scan offset), not at the frame time: a fallback
+            # scan or a late-scanned row would otherwise brighten as the frame
+            # sun rises.
+            if kind == "vis":
+                source_sun = _upsample(cos_solar_zenith(
+                    lon_grid, lat_grid, source.time or _WHEN,
+                    scan_offset_minutes(lon_grid, lat_grid, source.satellite_lon, source.name),
+                ))
+                mask = active & (source_sun > NIGHT_COS_SZA)
+            else:
+                mask = active
             if mask.all():
                 pick = slice(None)
             elif mask.any():
@@ -812,12 +880,14 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
             row_nodes, col_nodes = layer.fractional_index(lon_grid, lat_grid)
             row, col = _upsample(row_nodes).reshape(-1)[pick], _upsample(col_nodes).reshape(-1)[pick]
             value, valid = bilinear_sample(layer.codes, row, col)
-            if kind == "vis" and source.vis_is_blue:
-                value = np.where(
-                    valid > 0,
-                    reflectance_code(blue_to_red_reflectance(reflectance_from_code(value))).astype(np.float32),
-                    0.0,
-                )
+            if kind == "vis":
+                reflectance = reflectance_from_code(value)
+                if source.vis_is_blue:
+                    reflectance = blue_to_red_reflectance(reflectance)
+                sun = source_sun.reshape(-1)[pick]
+                normalised = remove_low_sun_haze(reflectance / np.maximum(sun, VIS_NORMALISATION_FLOOR), sun)
+                # Blend in code space, unrounded, so overlaps stay smooth.
+                value = np.where(valid > 0, 1.0 + 254.0 * np.sqrt(np.clip(normalised, 0.0, 1.0)), 0.0)
             layer_weight = weight.reshape(-1)[pick] * valid
             if layer.clipped_box:
                 layer_weight *= _box_fade(layer, row, col)
@@ -829,9 +899,7 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
 
     vis_num, vis_den = sums["vis"]
     has_vis = vis_den > 1e-4
-    reflectance = reflectance_from_code(vis_num / np.maximum(vis_den, 1e-9))
-    normalised = remove_low_sun_haze(reflectance / np.maximum(cos_sun, VIS_NORMALISATION_FLOOR), cos_sun)
-    vis = np.where(has_vis & (cos_sun > NIGHT_COS_SZA), reflectance_code(normalised), 0).astype(np.uint8)
+    vis = np.where(has_vis, np.clip(np.rint(vis_num / np.maximum(vis_den, 1e-9)), 1, 255), 0).astype(np.uint8)
     ir[~inside_cap] = 0
     vis[~inside_cap] = 0
     if not ir.any() and not vis.any():
@@ -839,14 +907,17 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
     return {"block": block, "ir": ir, "vis": vis}
 
 
-# Correct low-sun haze before encoding visible reflectance.
+# Correct low-sun haze before encoding visible reflectance. The haze is
+# subtracted, not subtracted and re-stretched: stretching by 1/(1 - base)
+# brightened every cloud by up to 22% at low sun, and that gain changed from
+# one frame to the next.
 HAZE_COS = np.array([0, .02, .06, .10, .14, .18, .22, .26, .30, .34, .40, .50, .60, .75])
 HAZE_BASE = np.array([0, .05, .085, .12, .15, .17, .18, .17, .16, .15, .13, .10, .08, 0])
 
 
 def remove_low_sun_haze(normalised: np.ndarray, cos_sun: np.ndarray) -> np.ndarray:
     base = np.interp(cos_sun, HAZE_COS, HAZE_BASE)
-    return np.maximum(normalised - base, 0) / (1 - base)
+    return np.maximum(normalised - base, 0)
 
 
 def downsample_codes(codes: np.ndarray) -> np.ndarray:
