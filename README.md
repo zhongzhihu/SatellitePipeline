@@ -17,7 +17,7 @@ Each manifest update retains the packs referenced by the current and previous ma
 - The normalisation floor is cos(sza) 0.08.
 - Low-sun haze is subtracted without re-stretching.
 
-In the app, visible imagery eases in over cos(sza) 0.05 to min(0.45, 0.8 × noon cos), so winter high latitudes still reach the full daytime look.
+In the app, the visible weight rises linearly in solar time over 2.5 hours after the sun crosses cos(sza) 0.05, or until local noon when that is sooner, and falls symmetrically in the afternoon. Red-band MTG imagery shows low cloud that IR misses. A ramp in cos(sza) reveals it mostly in the first hour after sunrise and sweeps a brightening band west across the Atlantic between 10-minute frames. A ramp to noon kept the per-frame change smallest, but on 6 October 2026 it left a stratocumulus deck over the Netherlands at about a third of its opacity at 07:40 UTC, while forecasts showed overcast. With 2.5 hours, mean brightening on the 3 October crops is about 0.6–1.3 gray levels per frame, against 2.5–2.9 for "Before". Winter high latitudes still reach the full daytime look at noon.
 
 EUMETView supplies 8-bit grayscale imagery without a published calibration. Treating FES gray/255 as reflectance is an approximation. The previews isolate MTG and omit satellite fallbacks, the basemap and AVIF compression.
 

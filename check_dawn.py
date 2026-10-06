@@ -5,7 +5,9 @@ Run `python3 check_dawn.py`. Cached WCS crops, a contact sheet, and numerical
 results go to results/dawn. The colouriser below mirrors the app pixel math.
 "Before" reproduces the settings of the reported 2026-10-04 screenshots
 (linear MTG gray, frame-time sun, 0.2 floor, re-stretched haze, 0.10–0.30
-app ramp); "After" uses the current publisher and app code.
+app ramp); "After" uses the current publisher and app code, whose visible
+weight rises linearly in solar time over 2.5 h from cos(sza) 0.05 (or to
+local noon when that comes first).
 """
 from __future__ import annotations
 
@@ -59,11 +61,20 @@ def old_haze(normalised, cos_sun):
     return np.maximum(normalised - base, 0) / (1 - base)
 
 
-def daylight(cos_sun, cos_noon):
-    """ForecastMapSatelliteColouriser.daylight."""
-    top = np.maximum(np.minimum(.45, .8 * cos_noon), .10)
-    t = np.clip((cos_sun - .05) / (top - .05), 0, 1)
-    return t * t * (3 - 2 * t)
+VISIBLE_RAMP_HOUR_ANGLE = np.deg2rad(15 * 2.5)  # visibleRampHourAngle
+
+
+def daylight(lon, lat, when):
+    """ForecastMapSatelliteColouriser.daylight: linear in solar time over
+    2.5 h from cos(sza) 0.05, or to local noon when that comes first."""
+    declination, equation_of_time, hours = m.solar_terms(when)
+    radians = np.deg2rad((hours * 60 + equation_of_time + 4 * lon) / 4 - 180)
+    hour_angle = np.abs(np.remainder(radians + np.pi, 2 * np.pi) - np.pi)
+    a = np.sin(np.deg2rad(lat)) * np.sin(declination)
+    b = np.cos(np.deg2rad(lat)) * np.cos(declination)
+    onset = np.arccos(np.clip((.05 - a) / b, -1, 1))
+    span = np.minimum(onset, VISIBLE_RAMP_HOUR_ANGLE)
+    return np.where(onset > 0, np.clip((onset - hour_angle) / np.maximum(span, 1e-6), 0, 1), 0)
 
 
 def colourise(ir, vis, day):
@@ -93,8 +104,7 @@ def render(variant, raw, ir, lon, lat, when):
     reflectance = m.reflectance_from_code(m.MTG_VIS_GRAY_LUT[raw])
     normalised = m.remove_low_sun_haze(reflectance / np.maximum(scan_sun, m.VIS_NORMALISATION_FLOOR), scan_sun)
     vis = np.where(scan_sun > m.NIGHT_COS_SZA, m.reflectance_code(normalised), 0).astype(np.uint8)
-    cos_noon = np.cos(np.deg2rad(lat) - m.solar_terms(when)[0])
-    return colourise(ir, vis, daylight(frame_sun, cos_noon))
+    return colourise(ir, vis, daylight(lon, lat, when))
 
 
 def main():
