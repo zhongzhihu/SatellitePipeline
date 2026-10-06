@@ -104,7 +104,7 @@ def publish_manifest(store: R2Store, frames: list[dict], allow_rewind: bool = Fa
     frames = sorted(frames, key=lambda frame: support.parse_utc(frame["valid_time"]))
     validate_timeline(frames)
     store.publish_manifest({
-        "schema_version": 2,
+        "schema_version": 1,
         "generated_at": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "product": PRODUCT,
         "crs": "EPSG:3857",
