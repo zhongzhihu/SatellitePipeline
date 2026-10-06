@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 FRAME_STEP = timedelta(minutes=10)
@@ -52,3 +53,25 @@ def publishable_window(available: set[datetime], published_latest: datetime | No
     while count < MAX_FRAME_COUNT and newest - FRAME_STEP * count in available:
         count += 1
     return frame_window(newest, count)
+
+
+def validate_timeline(frames: list[dict]) -> None:
+    """Reject a manifest timeline the Worker and app cannot serve.
+
+    ``frames`` must be ordered oldest first, with consecutive ten-minute valid
+    times, ids matching their times, and pack revisions the tile route accepts.
+    """
+    if not 1 <= len(frames) <= MAX_FRAME_COUNT:
+        raise ValueError(f"A timeline must have between 1 and {MAX_FRAME_COUNT} frames")
+    times = []
+    for frame in frames:
+        when = datetime.fromisoformat(frame["valid_time"].replace("Z", "+00:00"))
+        if when.minute % 10 or when.second or when.microsecond:
+            raise ValueError(f"Frame {frame['id']} does not align to a ten-minute step")
+        if frame["id"] != when.strftime("%Y%m%dT%H%MZ"):
+            raise ValueError(f"Frame id {frame['id']} does not match {frame['valid_time']}")
+        if not re.fullmatch(r"[a-z0-9]{1,16}", frame["pack"]) or not frame.get("pack_bytes"):
+            raise ValueError(f"Frame {frame['id']} has an invalid pack")
+        times.append(when)
+    if any(later - earlier != FRAME_STEP for earlier, later in zip(times, times[1:])):
+        raise ValueError("Frame times must be consecutive ten-minute steps")

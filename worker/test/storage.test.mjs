@@ -3,49 +3,82 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
 const source = await readFile(new URL('../src/index.js', import.meta.url), 'utf8');
-const { default: worker, V2_ENCODING: encoding } = await import(`data:text/javascript;base64,${Buffer.from(source + "\nexport { V2_ENCODING };").toString('base64')}`);
+const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+function memoryCache() {
+  const store = new Map();
+  globalThis.caches = { default: {
+    async match(request) { return store.get(request.url)?.clone(); },
+    async put(request, response) { store.set(request.url, response); },
+  } };
+  return store;
+}
 
 for (const [prefix, root] of [[undefined, ''], ['', ''], ['///', ''], ['/custom/path/', 'custom/path/']]) {
-  test(`manifest reads and multipart uploads use literal storage prefix ${JSON.stringify(prefix)}`, async () => {
+  test(`client manifest reads use literal storage prefix ${JSON.stringify(prefix)}`, async () => {
+    memoryCache();
     const keys = [];
-    const env = {
-      SATELLITE_STORAGE_PREFIX: prefix,
-      SATELLITE_PUBLISHER_TOKEN: 'test',
-      SATELLITE_BUCKET: {
-        async get(key) { keys.push(key); return { text: async () => '{"frames":[]}' }; },
-        async createMultipartUpload(key) { keys.push(key); return { key, uploadId: 'upload' }; },
-      },
-    };
-    const headers = { Authorization: 'Bearer test' };
-    const manifest = await worker.fetch(new Request('https://example.com/v2/publish/manifest', { headers }), env, {});
-    assert.equal(manifest.status, 200);
-    const upload = await worker.fetch(new Request('https://example.com/v2/publish/packs/20261004T2200Z/abc123/uploads', { method: 'POST', headers }), env, {});
-    assert.equal(upload.status, 201);
-    assert.deepEqual(keys, [`${root}manifest.json`, `${root}packs/20261004T2200Z-abc123.pack`]);
-    assert.equal((await upload.json()).key, keys[1]);
+    const env = { SATELLITE_STORAGE_PREFIX: prefix, SATELLITE_CLIENT_AUTH_SECRET: 'client', SATELLITE_TILE_SIGNING_SECRET: 's', SATELLITE_BUCKET: {
+      async get(key) { keys.push(key); return { text: async () => '{"frames":[{"id":"20261004T2200Z","pack":"abc123"}]}' }; },
+    } };
+    const response = await worker.fetch(new Request('https://example.com/v2/client-manifest', { headers: { 'X-Client-Auth': 'client' } }), env, { waitUntil() {} });
+    assert.equal(response.status, 200);
+    assert.deepEqual(keys, [`${root}manifest.json`]);
+    delete globalThis.caches;
   });
 }
 
-test('retention scans root packs and preserves referenced packs', async () => {
-  // Exercise publication, header validation, and asynchronous retention together.
+test('publishing routes are not served', async () => {
+  for (const [method, path] of [['GET', '/v2/publish/manifest'], ['PUT', '/v2/publish/manifest'], ['POST', '/v2/publish/packs/20261004T2200Z/abc123/uploads']]) {
+    const response = await worker.fetch(new Request(`https://example.com${path}`, { method }), {}, {});
+    assert.equal(response.status, 404);
+  }
+});
+
+test('tile reads load header and index in one R2 read and share it through the cache', async () => {
   const id = '20261004T2200Z', pack = 'abc123', key = `packs/${id}-${pack}.pack`;
-  const header = new Uint8Array(20);
-  header.set(new TextEncoder().encode('WXSP'));
-  const view = new DataView(header.buffer);
+  const indexBytes = 20 + 1364 * 8, tile = new Uint8Array([7, 8, 9]);
+  const head = new Uint8Array(indexBytes);
+  head.set(new TextEncoder().encode('WXSP'));
+  const view = new DataView(head.buffer);
   [3, 1, 5, 1364].forEach((value, i) => view.setUint32(4 + i * 4, value, true));
-  const reads = [], writes = [], lists = [], deletes = [], pending = [];
-  const manifest = { schema_version: 2, crs: 'EPSG:3857', tile_size: 1024, minimum_zoom_level: 1, maximum_zoom_level: 5, encoding, frames: [{ id, pack, valid_time: '2026-10-04T22:00:00Z' }] };
-  const env = { SATELLITE_PUBLISHER_TOKEN: 'test', SATELLITE_BUCKET: {
-    async get(k) { reads.push(k); return k === key ? { arrayBuffer: async () => header.buffer, size: 20000 } : null; },
-    async put(k) { writes.push(k); },
-    async list(options) { lists.push(options.prefix); return { objects: [key, 'packs/obsolete.pack'].map(k => ({ key: k, uploaded: new Date(0) })), truncated: false }; },
-    async delete(keys) { deletes.push(...keys); },
+  view.setUint32(20, indexBytes, true); // z1/0/0
+  view.setUint32(24, tile.length, true);
+  const store = memoryCache(), reads = [], pending = [];
+  const env = { SATELLITE_TILE_SIGNING_SECRET: 's', SATELLITE_BUCKET: {
+    async get(k, { range }) {
+      reads.push(range);
+      const bytes = range.offset === 0 ? head.slice(0, range.length) : tile;
+      return { arrayBuffer: async () => bytes.buffer, body: bytes, size: indexBytes + tile.length };
+    },
   } };
-  const response = await worker.fetch(new Request('https://example.com/v2/publish/manifest', { method: 'PUT', headers: { Authorization: 'Bearer test' }, body: JSON.stringify(manifest) }), env, { waitUntil(promise) { pending.push(promise); } });
-  assert.equal(response.status, 200, await response.text());
+  const ctx = { waitUntil(promise) { pending.push(promise); } };
+  const manifestKey = 'satellite-tiles-v2';
+  const exp = Math.floor(Date.now() / 1000) + 600;
+  const signingKey = await crypto.subtle.importKey('raw', new TextEncoder().encode('s'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = Buffer.from(await crypto.subtle.sign('HMAC', signingKey, new TextEncoder().encode(`${manifestKey}\n${id}\n${pack}\n${exp}`))).toString('base64url');
+  const response = await worker.fetch(new Request(`https://example.com/v2/tiles/${id}/${pack}/1/0/0.avif?exp=${exp}&sig=${sig}`), env, ctx);
+  assert.equal(response.status, 200);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [7, 8, 9]);
   await Promise.all(pending);
-  assert.deepEqual(reads, [key, 'manifest.json']);
-  assert.deepEqual(writes, ['manifest.json']);
-  assert.deepEqual(lists, ['packs/']);
-  assert.deepEqual(deletes, ['packs/obsolete.pack']);
+  assert.deepEqual(reads, [{ offset: 0, length: indexBytes }, { offset: indexBytes, length: 3 }]);
+  assert.ok(store.has(`https://example.com/v2/pack-index/${key}`));
+  delete globalThis.caches;
+});
+
+test('client manifest is read from R2 once and then served from the colo cache', async () => {
+  const store = memoryCache(), reads = [], pending = [];
+  const manifest = { frames: [{ id: '20261004T2200Z', pack: 'abc123', valid_time: '2026-10-04T22:00:00Z' }] };
+  const env = { SATELLITE_CLIENT_AUTH_SECRET: 'client', SATELLITE_TILE_SIGNING_SECRET: 's', SATELLITE_BUCKET: {
+    async get(k) { reads.push(k); return { text: async () => JSON.stringify(manifest) }; },
+  } };
+  const ctx = { waitUntil(promise) { pending.push(promise); } };
+  for (let i = 0; i < 2; i += 1) {
+    const response = await worker.fetch(new Request('https://example.com/v2/client-manifest', { headers: { 'X-Client-Auth': 'client' } }), env, ctx);
+    assert.equal(response.status, 200);
+    assert.match((await response.json()).frames[0].tile_url_template, /\/v2\/tiles\/20261004T2200Z\/abc123\//);
+    await Promise.all(pending);
+  }
+  assert.deepEqual(reads, ['manifest.json']);
+  delete globalThis.caches;
 });

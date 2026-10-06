@@ -1,10 +1,10 @@
 # Satellite observation pipeline
 
-Builds packed infrared and visible observation tiles from public NOAA and EUMETSAT feeds, then publishes each frame through a Cloudflare Worker to R2.
+Builds packed infrared and visible observation tiles from public NOAA and EUMETSAT feeds, then uploads each frame directly to R2 through its S3 API. A Cloudflare Worker serves the manifest and tiles to clients.
 
-The scheduled GitHub Actions workflow runs every ten minutes and can also be started manually. A cold start or manual restart searches up to three hours back for the newest ten-minute slot with ready GOES and Himawari inputs, then publishes that frame alone. Scheduled runs continue from the last published timestamp by exactly ten minutes, so a restart does not build an old backlog before reaching current data. The manifest grows from one to six contiguous frames as scheduled runs succeed. A shared Actions concurrency group serializes workflow runs, and the publisher also preserves ordering if frame builds overlap.
+The scheduled GitHub Actions workflow runs every ten minutes and can also be started manually. A cold start or manual restart searches up to three hours back for the newest ten-minute slot with ready GOES and Himawari inputs, then publishes that frame alone. Scheduled runs continue from the last published timestamp by exactly ten minutes, so a restart does not build an old backlog before reaching current data. The manifest grows from one to six contiguous frames as scheduled runs succeed. A shared Actions concurrency group serializes workflow runs, and the publisher also preserves ordering if frame builds overlap: `manifest.json` is replaced with a conditional write against the version the run read, and a timeline older than the published one is rejected unless a run backfills from an explicit `SATELLITE_START_UTC`.
 
-Each manifest update retains the packs referenced by the current and previous manifests. Other packs are eligible for cleanup after the three-hour retention window, so clients with a briefly cached previous manifest can continue fetching its tiles.
+After each manifest update the publisher keeps the packs referenced by the current and previous manifests. It deletes other packs once they are older than three hours, so clients with a briefly cached previous manifest can continue fetching its tiles.
 
 ## Dawn rendering check
 
@@ -23,7 +23,9 @@ EUMETView supplies 8-bit grayscale imagery without a published calibration. Trea
 
 ## GitHub settings
 
-Set repository variable `SATELLITE_PUBLISHER_URL` to the Worker base URL and secret `SATELLITE_PUBLISH_TOKEN` to its publisher token. The workflow keeps bootstrap lookback, image quality, worker count, and input wait settings in its environment.
+Set repository secrets `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`, the last two from an R2 API token with Object Read & Write scoped to that bucket. Set variable `SATELLITE_STORAGE_PREFIX` only if the Worker uses a prefix; the two must match. The workflow keeps bootstrap lookback, image quality, worker count, and input wait settings in its environment.
+
+Run `python3 -m unittest -v test_r2_store` to check manifest publication and pack retention.
 
 Hosted runners start with an empty filesystem. Downloaded source data is cached only during a workflow run, while pip packages use the Actions cache.
 
@@ -33,4 +35,4 @@ The MTG visible WCS gray index is mapped to the Meteosat 0° (FES) gray index be
 
 ## Worker
 
-`worker/src/index.js` implements the upload, manifest, retention, and tile-serving API. Its account-specific Wrangler configuration is kept locally in the ignored `worker/wrangler.jsonc`; configure the R2 binding and custom domain there when deploying the Worker. Configure these Worker secrets: `SATELLITE_PUBLISHER_TOKEN`, `SATELLITE_TILE_SIGNING_SECRET`, and `SATELLITE_CLIENT_AUTH_SECRET`. Set `SATELLITE_CLIENT_AUTH_HEADER` to the header sent by your client, and set `SATELLITE_CLIENT_AUTH_SECRET` to the matching client token. A value bundled with a client is an access gate, not a confidential secret. The tile-signing secret and publisher token remain server-side. `SATELLITE_STORAGE_PREFIX` selects an optional object prefix used by the Worker; unset or empty publishes `manifest.json` and `packs/<frame>-<revision>.pack` directly at the bucket root. A nonempty value is used literally, without an appended version folder. The `/v2/...` API routes and manifest schema remain versioned independently of the R2 layout.
+`worker/src/index.js` serves the signed client manifest and tiles from R2; it has no publishing routes. Its account-specific Wrangler configuration is kept locally in the ignored `worker/wrangler.jsonc`; configure the R2 binding and custom domain there when deploying the Worker. Configure these Worker secrets: `SATELLITE_TILE_SIGNING_SECRET` and `SATELLITE_CLIENT_AUTH_SECRET`. Set `SATELLITE_CLIENT_AUTH_HEADER` to the header sent by your client, and set `SATELLITE_CLIENT_AUTH_SECRET` to the matching client token. A value bundled with a client is an access gate, not a confidential secret. The tile-signing secret remains server-side. `SATELLITE_STORAGE_PREFIX` selects an optional object prefix shared by the Worker and publisher; unset or empty publishes `manifest.json` and `packs/<frame>-<revision>.pack` directly at the bucket root. A nonempty value is used literally, without an appended version folder. The `/v2/...` API routes and manifest schema remain versioned independently of the R2 layout.

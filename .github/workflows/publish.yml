@@ -26,8 +26,11 @@ jobs:
     outputs:
       started_epoch: ${{ steps.start.outputs.epoch }}
     env:
-      SATELLITE_PUBLISHER_URL: ${{ vars.SATELLITE_PUBLISHER_URL }}
-      SATELLITE_PUBLISH_TOKEN: ${{ secrets.SATELLITE_PUBLISH_TOKEN }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      SATELLITE_STORAGE_PREFIX: ${{ vars.SATELLITE_STORAGE_PREFIX }}
       SATELLITE_FRAME_COUNT: "1"
       SATELLITE_BOOTSTRAP_LOOKBACK_MINUTES: "180"
       SATELLITE_RESTART_FROM_LATEST: ${{ (github.event_name == 'workflow_dispatch' && !inputs.continuation) && '1' || '0' }}
@@ -48,8 +51,10 @@ jobs:
           cache-dependency-path: requirements.lock
       - name: Check publisher settings
         run: |
-          test -n "$SATELLITE_PUBLISHER_URL" || { echo "SATELLITE_PUBLISHER_URL variable is required"; exit 1; }
-          test -n "$SATELLITE_PUBLISH_TOKEN" || { echo "SATELLITE_PUBLISH_TOKEN secret is required"; exit 1; }
+          test -n "$R2_ACCOUNT_ID" || { echo "R2_ACCOUNT_ID secret is required"; exit 1; }
+          test -n "$R2_BUCKET_NAME" || { echo "R2_BUCKET_NAME secret is required"; exit 1; }
+          test -n "$R2_ACCESS_KEY_ID" || { echo "R2_ACCESS_KEY_ID secret is required"; exit 1; }
+          test -n "$R2_SECRET_ACCESS_KEY" || { echo "R2_SECRET_ACCESS_KEY secret is required"; exit 1; }
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.lock
       - name: Build and publish

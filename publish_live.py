@@ -8,19 +8,15 @@ import gc
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import mosaic_v2 as mosaic
-from frame_schedule import FRAME_STEP, MAX_FRAME_COUNT, missing_frames, publishable_window
+from frame_schedule import FRAME_STEP, MAX_FRAME_COUNT, missing_frames, publishable_window, validate_timeline
 import pipeline_support as support
+from r2_store import ManifestConflict, R2Store
 
 UTC = dt.timezone.utc
 DEFAULT_AVIF_QUALITY = 50
-PART_BYTES = 48 * 1024 * 1024  # R2: equal parts ≥ 5 MiB except the last
-WORKER_BASE_URL = ""
-WORKER_USER_AGENT = "SatellitePipelinePublisher/2.0"
 POLL_SECONDS = 30
 MAX_PUBLISH_CONFLICTS = 5
 DEFAULT_BOOTSTRAP_LOOKBACK_MINUTES = 180
@@ -43,62 +39,6 @@ def latest_available_frame(now: dt.datetime, lookback_minutes: int) -> dt.dateti
     )
 
 
-class WorkerHTTPError(RuntimeError):
-    def __init__(self, message: str, code: int) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-def worker_request(token: str, method: str, path: str, body: bytes | None = None,
-                   content_type: str = "application/json", timeout: int = 90, attempts: int = 4) -> dict | None:
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": WORKER_USER_AGENT}
-    if body is not None:
-        headers["Content-Type"] = content_type
-    for attempt in range(attempts):
-        request = urllib.request.Request(f"{WORKER_BASE_URL}{path}", data=body, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = response.read()
-                return json.loads(data) if data else {}
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            if error.code == 404 and method == "GET":
-                return None
-            if error.code < 500 or attempt == attempts - 1:
-                raise WorkerHTTPError(f"{method} {path} failed with HTTP {error.code}: {detail}", error.code) from error
-        except (urllib.error.URLError, TimeoutError) as error:
-            if attempt == attempts - 1:
-                raise RuntimeError(f"{method} {path} failed: {error}") from error
-        time.sleep(2 ** attempt * 3)
-    return None
-
-
-def upload_pack(token: str, frame_id: str, revision: str, path: Path) -> int:
-    base = f"/v2/publish/packs/{frame_id}/{revision}"
-    upload_id = worker_request(token, "POST", f"{base}/uploads")["upload_id"]
-    size = path.stat().st_size
-    parts = []
-    try:
-        with path.open("rb") as handle:
-            number = 1
-            while chunk := handle.read(PART_BYTES):
-                result = worker_request(
-                    token, "PUT", f"{base}/parts/{number}?upload_id={upload_id}", chunk,
-                    "application/octet-stream", timeout=300,
-                )
-                parts.append({"part_number": result["part_number"], "etag": result["etag"]})
-                number += 1
-        body = json.dumps({"parts": parts, "bytes": size}).encode()
-        worker_request(token, "POST", f"{base}/complete?upload_id={upload_id}", body)
-    except Exception:
-        try:
-            worker_request(token, "POST", f"{base}/abort?upload_id={upload_id}", attempts=1)
-        except Exception as abort_error:  # the original failure matters more
-            print(f"Abort of {frame_id} upload failed: {abort_error}", flush=True)
-        raise
-    return size
-
-
 def source_summary(sources: list[mosaic.Source], stats: dict) -> dict:
     availability = {}
     for source in sources:
@@ -116,7 +56,7 @@ def source_summary(sources: list[mosaic.Source], stats: dict) -> dict:
     }
 
 
-def build_frame(token: str, when: dt.datetime, revision: str, output_root: Path,
+def build_frame(store: R2Store, when: dt.datetime, revision: str, output_root: Path,
                 quality: int, workers: int) -> tuple[dict, int]:
     frame_started = time.perf_counter()
     frame_id = when.strftime("%Y%m%dT%H%MZ")
@@ -128,7 +68,7 @@ def build_frame(token: str, when: dt.datetime, revision: str, output_root: Path,
     summary = source_summary(sources, stats)
     del sources
     gc.collect()
-    size = upload_pack(token, frame_id, revision, output)
+    size = store.upload_pack(frame_id, revision, output)
     output.unlink(missing_ok=True)
     finished = time.perf_counter()
     summary["timing_seconds"] = {
@@ -146,37 +86,39 @@ def build_frame(token: str, when: dt.datetime, revision: str, output_root: Path,
         "id": frame_id,
         "valid_time": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "pack": revision,
+        "pack_bytes": size,
         "source_summary": summary,
     }, size
 
 
-def read_published_frames(token: str) -> dict[dt.datetime, dict] | None:
+def read_published_frames(store: R2Store) -> dict[dt.datetime, dict] | None:
     """The published timeline keyed by valid time, or ``None`` if it is missing or on another grid."""
-    manifest = worker_request(token, "GET", "/v2/publish/manifest")
+    manifest, _ = store.read_manifest()
     frames = (manifest or {}).get("frames", [])
     if not frames or (manifest.get("minimum_zoom_level"), manifest.get("maximum_zoom_level")) != (mosaic.MIN_ZOOM, mosaic.MAX_ZOOM):
         return None
     return {support.parse_utc(frame["valid_time"]): frame for frame in frames}
 
 
-def publish_manifest(token: str, frames: list[dict], allow_rewind: bool = False) -> None:
-    manifest = {
+def publish_manifest(store: R2Store, frames: list[dict], allow_rewind: bool = False) -> None:
+    frames = sorted(frames, key=lambda frame: support.parse_utc(frame["valid_time"]))
+    validate_timeline(frames)
+    store.publish_manifest({
         "schema_version": 2,
+        "generated_at": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "product": PRODUCT,
         "crs": "EPSG:3857",
+        "cadence_minutes": FRAME_STEP // dt.timedelta(minutes=1),
         "minimum_zoom_level": mosaic.MIN_ZOOM,
         "maximum_zoom_level": mosaic.MAX_ZOOM,
         "tile_size": mosaic.TILE_SIZE,
         "encoding": mosaic.ENCODING_DESCRIPTOR,
-        "frames": [{key: frame[key] for key in ("id", "valid_time", "pack", "source_summary")} for frame in frames],
-    }
-    path = "/v2/publish/manifest" + ("?allow_rewind=1" if allow_rewind else "")
-    result = worker_request(token, "PUT", path, json.dumps(manifest, separators=(",", ":")).encode())
-    if not result or result.get("published") is not True:
-        raise RuntimeError(f"Manifest publication failed: {result}")
+        "frames": [{key: frame[key] for key in ("id", "valid_time", "pack", "pack_bytes", "source_summary")}
+                   for frame in frames],
+    }, allow_rewind)
 
 
-def complete_timeline(token: str, target: dt.datetime, deadline: dt.datetime,
+def complete_timeline(store: R2Store, target: dt.datetime, deadline: dt.datetime,
                       built: dict[dt.datetime, dict], build) -> list[str]:
     """Publish ``target`` once the frames before it exist, filling only frames whose owner failed.
 
@@ -187,7 +129,7 @@ def complete_timeline(token: str, target: dt.datetime, deadline: dt.datetime,
     conflicts = 0
     waiting_for: list[dt.datetime] = []
     while True:
-        published = read_published_frames(token) or {}
+        published = read_published_frames(store) or {}
         latest = max(published, default=None)
         if latest is not None and latest >= target:
             return published_ids
@@ -196,11 +138,11 @@ def complete_timeline(token: str, target: dt.datetime, deadline: dt.datetime,
         if window:
             frames = [available[when] for when in window]
             try:
-                publish_manifest(token, frames)
-            except WorkerHTTPError as error:
+                publish_manifest(store, frames)
+            except ManifestConflict as error:
                 # Another run published between our read and write.
                 conflicts += 1
-                if error.code != 409 or conflicts > MAX_PUBLISH_CONFLICTS:
+                if conflicts > MAX_PUBLISH_CONFLICTS:
                     raise
                 print(f"Manifest rejected, re-reading the timeline: {error}", flush=True)
                 time.sleep(2)
@@ -254,13 +196,7 @@ def wait_for_inputs(when: dt.datetime, until: dt.datetime) -> None:
 
 
 def main() -> None:
-    global WORKER_BASE_URL
-    token = os.environ.get("SATELLITE_PUBLISH_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("SATELLITE_PUBLISH_TOKEN is required")
-    WORKER_BASE_URL = os.environ.get("SATELLITE_PUBLISHER_URL", "").rstrip("/")
-    if not WORKER_BASE_URL:
-        raise RuntimeError("SATELLITE_PUBLISHER_URL is required")
+    store = R2Store.from_environment()
 
     count = int(os.environ.get("SATELLITE_FRAME_COUNT", "1"))
     bootstrap_lookback = int(os.environ.get(
@@ -286,7 +222,7 @@ def main() -> None:
         "1", "true", "yes",
     }
     now = dt.datetime.now(UTC)
-    published = read_published_frames(token)
+    published = read_published_frames(store)
     if explicit_start:
         first = support.parse_utc(os.environ["SATELLITE_START_UTC"])
         frame_times = [first + FRAME_STEP * index for index in range(count)]
@@ -343,7 +279,7 @@ def main() -> None:
 
     def build(when: dt.datetime) -> None:
         nonlocal uploaded_bytes
-        built[when], size = build_frame(token, when, revision, output_root, quality, workers)
+        built[when], size = build_frame(store, when, revision, output_root, quality, workers)
         uploaded_bytes += size
 
     if rolling:
@@ -356,15 +292,15 @@ def main() -> None:
     if rolling:
         # Wait for another run's frame before attempting to take over its slot.
         deadline = dt.datetime.now(UTC) + dt.timedelta(minutes=max_wait + owner_timeout)
-        frame_ids = complete_timeline(token, frame_times[-1], deadline, built, build)
+        frame_ids = complete_timeline(store, frame_times[-1], deadline, built, build)
     elif bootstrap:
         frames = [built[frame_times[-1]]]
-        publish_manifest(token, frames)
+        publish_manifest(store, frames)
         frame_ids = [frame["id"] for frame in frames]
     else:
         merged = {**(published or {}), **built}
         frames = [merged[when] for when in sorted(merged)][-MAX_FRAME_COUNT:]
-        publish_manifest(token, frames, allow_rewind=explicit_start)
+        publish_manifest(store, frames, allow_rewind=explicit_start)
         frame_ids = [frame["id"] for frame in frames]
     print(json.dumps({
         "frame_ids": frame_ids,
