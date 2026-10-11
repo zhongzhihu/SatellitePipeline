@@ -2,7 +2,7 @@
 
 Builds packed infrared and visible observation tiles from public NOAA and EUMETSAT feeds, then uploads each frame directly to R2 through its S3 API. A Cloudflare Worker serves the manifest and tiles to clients.
 
-The scheduled GitHub Actions workflow runs every ten minutes and can also be started manually. A cold start or manual restart searches up to three hours back for the newest ten-minute slot with ready GOES and Himawari inputs, then publishes that frame alone. Scheduled runs continue from the last published timestamp by exactly ten minutes, so a restart does not build an old backlog before reaching current data. The manifest grows from one to six contiguous frames as scheduled runs succeed. A shared Actions concurrency group serializes workflow runs, and the publisher also preserves ordering if frame builds overlap: `manifest.json` is replaced with a conditional write against the version the run read, and a timeline older than the published one is rejected unless a run backfills from an explicit `SATELLITE_START_UTC`.
+The GitHub Actions workflow maintains a ten-minute cadence through a continuation job that dispatches the next run, with an hourly cron as a recovery trigger. It can also be started manually. A cold start or manual restart searches up to three hours back for the newest ten-minute slot with ready GOES and Himawari inputs, then publishes that frame alone. Normal runs advance the last published timestamp by ten minutes. When the published timeline is at least 40 minutes behind the current time and the newest ready input is more than one slot ahead, the publisher reseeds at that newest slot. The manifest grows from one to six contiguous frames as runs succeed. A shared Actions concurrency group serializes entire workflow runs, including the continuation job. The publisher replaces `manifest.json` with a conditional write against the version read immediately before publication and rejects an older timeline unless `SATELLITE_START_UTC` explicitly allows rewinding.
 
 After each manifest update the publisher keeps the packs referenced by the current and previous manifests. It deletes other packs once they are older than three hours, so clients with a briefly cached previous manifest can continue fetching its tiles.
 
@@ -27,7 +27,11 @@ Set repository secrets `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID` and
 
 Run `python3 -m unittest -v test_r2_store` to check manifest publication and pack retention.
 
+Run `python3 -m unittest discover -v` and `node --test worker/test/storage.test.mjs` to run the offline regression suites. Completely empty frames are rejected before upload, preserving the published timeline.
+
 Hosted runners start with an empty filesystem. Downloaded source data is cached only during a workflow run, while pip packages use the Actions cache.
+
+Failed native channels and Himawari channels with fewer than ten downloaded segments are retried once. If the retry still cannot complete a Himawari channel, a successfully decoded partial layer is retained to preserve usable coverage. Source weights are selected separately for IR and VIS, so a missing channel does not suppress another satellite's channel. WCS gray zero remains nodata through IR and visible calibration.
 
 MTG is downloaded in 35° chunks. If any chunk fails, the entire channel is rejected and both IR and VIS are retried together at an earlier scan, up to 30 minutes back. If no complete scan is available within the download budget, the other satellites supply coverage. Do not publish partial MTG canvases: filling individual holes from MSG produces rectangular brightness seams between differently calibrated products. Run `python3 -m unittest -v test_wcs_completeness` to check this behavior.
 

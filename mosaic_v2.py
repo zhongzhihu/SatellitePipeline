@@ -61,8 +61,8 @@ PACK_VERSION = 3
 PACK_HEADER = struct.Struct("<4sIIII")  # magic, version, min zoom, max zoom, entry count
 INDEX_ENTRY = struct.Struct("<II")  # absolute offset, length (0 = empty tile)
 
-# Published in the v2 manifest; the Worker rejects any other descriptor so
-# the publisher and Worker use the same scale.
+# Published in the v2 manifest so clients can decode the channel scales.
+# The Worker validates the pack header and passes this descriptor through.
 ENCODING_DESCRIPTOR = {
     "format": "avif",
     "layout": "ir-over-vis",
@@ -135,7 +135,7 @@ def blue_to_red_reflectance(blue: np.ndarray) -> np.ndarray:
 
 
 def anchor_lut(anchors: tuple[tuple[int, float], ...]) -> np.ndarray:
-    """256-entry gray → IR code table, extrapolated linearly past the anchors."""
+    """WCS gray → IR codes, extrapolated past anchors; zero stays nodata."""
     gray = np.array([a for a, _ in anchors], dtype=np.float64)
     bt = np.array([b for _, b in anchors], dtype=np.float64)
     x = np.arange(256, dtype=np.float64)
@@ -144,10 +144,13 @@ def anchor_lut(anchors: tuple[tuple[int, float], ...]) -> np.ndarray:
     high_slope = (bt[-1] - bt[-2]) / (gray[-1] - gray[-2])
     values = np.where(x < gray[0], bt[0] + (x - gray[0]) * low_slope, values)
     values = np.where(x > gray[-1], bt[-1] + (x - gray[-1]) * high_slope, values)
-    return ir_code(values.astype(np.float32))
+    lut = ir_code(values.astype(np.float32))
+    lut[0] = 0
+    return lut
 
 
 VIS_GRAY_LUT = reflectance_code(np.arange(256, dtype=np.float32) / 255.0)
+VIS_GRAY_LUT[0] = 0  # WCS nodata, not zero reflectance
 
 # EUMETView's MSG vis006 gray is linear in reflectance, but its MTG vis06_hrfi
 # gray is gamma-encoded: dark scenes are lifted and the curve is not a
@@ -515,24 +518,28 @@ NATIVE_CHANNELS = {
 def load_native_layers(when: dt.datetime) -> dict[tuple[str, str], tuple[NativeLayer, dict]]:
     """Download and decode the GOES and Himawari channels for ``when``.
 
-    A listed channel that fails to download or decode is fetched once more: a
-    transient endpoint error, or another run pruning the shared cache, would
-    otherwise publish the frame without that satellite.
+    Failed channels and Himawari channels with fewer than ten segments are
+    fetched once more. Keep a successfully decoded partial layer if the retry
+    cannot complete it, so usable coverage is not discarded.
     """
     layers: dict[tuple[str, str], tuple[NativeLayer, dict]] = {}
     wanted: set[tuple[str, str]] | None = None
     for attempt in range(2):
         grouped, listed = download_native(when, wanted)
+        incomplete = set()
         for key in sorted(listed):
             files = [item["path"] for item in grouped.get(key, [])]
             if not files:
                 continue
+            if key[0] == "H09" and len(files) < 10:
+                incomplete.add(key)
+                print(f"H09 {key[1]} has {len(files)}/10 downloaded segments", flush=True)
             reader, kind = NATIVE_CHANNELS[key]
             try:
                 layers[key] = load_native_layer(files, reader, key[1], kind)
             except Exception as exc:
                 print(f"{key[0]} {key[1]} load failed: {exc}", flush=True)
-        wanted = listed - layers.keys()
+        wanted = (listed - layers.keys()) | incomplete
         if not wanted:
             break
         if attempt == 0:
@@ -607,11 +614,14 @@ def wcs_get(
     url = f"{WCS_URL}?{urllib.parse.urlencode(params)}"
     error: Exception | None = None
     for attempt in range(8):
-        if deadline is not None and time.monotonic() > deadline:
-            break
+        timeout = 120.0
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                break
         try:
             request = urllib.request.Request(url, headers={"User-Agent": WCS_USER_AGENT})
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = response.read()
             if body[:4] not in (b"II*\x00", b"MM\x00*"):
                 raise RuntimeError(f"WCS returned non-TIFF payload for {coverage}")
@@ -623,7 +633,12 @@ def wcs_get(
             error = exc
         except Exception as exc:  # rate limiting and transient network errors
             error = exc
-        time.sleep(min(30.0, 2.0 * 1.6**attempt))
+        delay = min(30.0, 2.0 * 1.6**attempt)
+        if deadline is not None:
+            delay = min(delay, deadline - time.monotonic())
+            if delay <= 0:
+                break
+        time.sleep(delay)
     raise RuntimeError(f"WCS request failed for {coverage}: {error}")
 
 
@@ -845,18 +860,22 @@ def render_block(block: tuple[int, int], world_px: int = WORLD_PX) -> dict | Non
     for source, cos_nodes in candidates:
         cos_pixels = _upsample(cos_nodes)
         scores.append((source, cos_pixels + source.penalty, smoothstep(*LIMB_FADE, cos_pixels)))
-    best = np.max(np.stack([score for _, score, _ in scores]), axis=0)
+    best = {}
+    for kind in ("ir", "vis"):
+        channel_scores = [score for source, score, _ in scores if getattr(source, kind) is not None]
+        if channel_scores:
+            best[kind] = np.max(channel_scores, axis=0)
 
     sums = {"ir": [np.zeros(shape, np.float32), np.zeros(shape, np.float32)],
             "vis": [np.zeros(shape, np.float32), np.zeros(shape, np.float32)]}
     for source, score, fade in scores:
-        weight = np.exp((score - best) / SOFTMAX_TAU) * fade
-        active = weight > 1e-6
-        if not active.any():
-            continue
         for kind in ("ir", "vis"):
             layer: NativeLayer | None = getattr(source, kind)
             if layer is None:
+                continue
+            weight = np.exp((score - best[kind]) / SOFTMAX_TAU) * fade
+            active = weight > 1e-6
+            if not active.any():
                 continue
             # Sample only pixels this source can affect. Visible reflectance is
             # normalised by the sun when this source imaged each pixel (its

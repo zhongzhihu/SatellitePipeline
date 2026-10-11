@@ -64,6 +64,8 @@ def build_frame(store: R2Store, when: dt.datetime, revision: str, output_root: P
     downloaded = time.perf_counter()
     output = output_root / f"{frame_id}.pack"
     stats = mosaic.build_frame_pack(when, sources, output, quality, workers)
+    if stats["tiles"] == 0:
+        raise RuntimeError(f"Refusing to publish empty satellite frame {frame_id}")
     rendered = time.perf_counter()
     summary = source_summary(sources, stats)
     del sources
