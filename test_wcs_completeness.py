@@ -69,6 +69,22 @@ class WcsCompletenessTests(unittest.TestCase):
         self.assertEqual(info["fallback_minutes"], 10)
         self.assertEqual(set(calls), {("ir", self.when), ("vis", self.when), ("ir", earlier), ("vis", earlier)})
 
+    def test_catalogue_known_old_visible_product_does_not_repeat_infrared_download(self):
+        layer = m.NativeLayer(np.full((2, 2), 100, np.uint8), None, -2, 2, 1, 1)
+
+        def fetch(name, coverage, when, lut, scale, deadline):
+            if coverage == "vis":
+                raise m.WmsTimeUnavailable("visible outside advertised times", self.when - dt.timedelta(hours=1))
+            return layer
+
+        with patch.dict(m.WCS_SOURCES, MTG=self.source), \
+                patch.object(m, "fetch_wcs_coverage", side_effect=fetch) as request:
+            ir, vis, info = m.fetch_wcs_source("MTG", self.when, 999)
+        self.assertIs(ir, layer)
+        self.assertIsNone(vis)
+        self.assertTrue(info["available"])
+        self.assertEqual(request.call_count, 2)
+
     def test_no_complete_scan_disables_source_instead_of_publishing_holes(self):
         with patch.dict(m.WCS_SOURCES, MTG=self.source), \
                 patch.object(m, "fetch_wcs_coverage", side_effect=m.WcsIncomplete("partial")):
@@ -76,6 +92,24 @@ class WcsCompletenessTests(unittest.TestCase):
         self.assertIsNone(ir)
         self.assertIsNone(vis)
         self.assertFalse(info["available"])
+
+    def test_unavailable_visible_scans_keep_newest_complete_infrared(self):
+        layer = m.NativeLayer(np.full((2, 2), 100, np.uint8), None, -2, 2, 1, 1)
+
+        def fetch(name, coverage, when, lut, scale, deadline):
+            if coverage == "vis":
+                raise m.WcsMissing("visible product stopped updating overnight")
+            return layer
+
+        with patch.dict(m.WCS_SOURCES, MTG=self.source), \
+                patch.object(m, "fetch_wcs_coverage", side_effect=fetch):
+            ir, vis, info = m.fetch_wcs_source("MTG", self.when, 999)
+        self.assertIs(ir, layer)
+        self.assertIsNone(vis)
+        self.assertTrue(info["available"])
+        self.assertFalse(info["vis_available"])
+        self.assertEqual(info["timestamp"], self.when.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(info["fallback_minutes"], 0)
 
 
 if __name__ == "__main__":

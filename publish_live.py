@@ -10,6 +10,8 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
+
 import mosaic_v2 as mosaic
 from frame_schedule import FRAME_STEP, MAX_FRAME_COUNT, missing_frames, publishable_window, validate_timeline
 import pipeline_support as support
@@ -56,6 +58,20 @@ def source_summary(sources: list[mosaic.Source], stats: dict) -> dict:
     }
 
 
+def has_european_infrared(sources: list[mosaic.Source]) -> bool:
+    """Require valid IR samples across western and central Europe before upload."""
+    longitude = np.array([0., 20., 0., 20.])
+    latitude = np.array([45., 45., 55., 55.])
+    covered = np.zeros(4, dtype=bool)
+    for source in sources:
+        if source.name not in ("MTG", "FES", "IODC") or source.ir is None:
+            continue
+        row, col = source.ir.fractional_index(longitude, latitude)
+        _, valid = mosaic.bilinear_sample(source.ir.codes, row, col)
+        covered |= valid > 0.5
+    return bool(covered.all())
+
+
 def build_frame(store: R2Store, when: dt.datetime, revision: str, output_root: Path,
                 quality: int, workers: int) -> tuple[dict, int]:
     frame_started = time.perf_counter()
@@ -66,6 +82,8 @@ def build_frame(store: R2Store, when: dt.datetime, revision: str, output_root: P
     stats = mosaic.build_frame_pack(when, sources, output, quality, workers)
     if stats["tiles"] == 0:
         raise RuntimeError(f"Refusing to publish empty satellite frame {frame_id}")
+    if not has_european_infrared(sources):
+        raise RuntimeError(f"Refusing to publish satellite frame {frame_id} without European infrared coverage")
     rendered = time.perf_counter()
     summary = source_summary(sources, stats)
     del sources

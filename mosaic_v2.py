@@ -17,11 +17,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from time import perf_counter
 
 import numpy as np
-from PIL import Image
+from PIL import Image, TiffImagePlugin
 
 import pipeline_support as support
 
@@ -78,6 +79,21 @@ ENCODING_DESCRIPTOR = {
 WCS_URL = "https://view.eumetsat.int/geoserver/wcs"
 WCS_USER_AGENT = "SatellitePipeline/2.0"
 WCS_WORKERS = 2
+WMS_URL = "https://view.eumetsat.int/geoserver/wms"
+# GetMap's plain raster style preserves the WCS gray indices. In particular,
+# MTG IR's default display style must not be used with our raw-gray LUT.
+WMS_LAYERS = {
+    "mtg_fd__ir105_hrfi": ("mtg_fd:ir105_hrfi", 0.01),
+    "mtg_fd__vis06_hrfi": ("mtg_fd:vis06_hrfi", 0.007125),
+    "msg_fes__ir108": ("msg_fes:ir108", 0.02767),
+    "msg_fes__vis006": ("msg_fes:vis006", 0.02767),
+    "msg_iodc__ir108": ("msg_iodc:ir108", 0.02767),
+    "msg_iodc__vis006": ("msg_iodc:vis006", 0.02767),
+}
+WMS_MAX_SIZE = 3500  # bound GetMap rendering memory, including MSG full disks
+_WMS_FALLBACKS: set[str] = set()
+_WMS_TIMES: dict[str, tuple[dt.datetime, dt.datetime]] = {}
+_WMS_TIMES_AT = -math.inf
 
 # Gray-to-temperature calibration anchors for EUMETView products.
 MTG_IR_ANCHORS = (
@@ -593,6 +609,14 @@ class WcsIncomplete(WcsMissing):
     """A coverage has failed chunks and must not enter the satellite mosaic."""
 
 
+class WmsTimeUnavailable(WcsMissing):
+    """The WMS catalogue proves this product/slot is not available."""
+
+    def __init__(self, message: str, latest: dt.datetime | None):
+        super().__init__(message)
+        self.latest = latest
+
+
 def wcs_get(
     coverage: str,
     when: dt.datetime,
@@ -601,6 +625,8 @@ def wcs_get(
     scale: float | None = None,
     deadline: float | None = None,
 ) -> bytes:
+    if coverage in _WMS_FALLBACKS:
+        return wms_get(coverage, when, lat, lon, scale, deadline)
     params = [
         ("service", "WCS"), ("version", "2.0.1"), ("request", "GetCoverage"),
         ("coverageId", coverage),
@@ -628,6 +654,10 @@ def wcs_get(
             return body
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:2000]
+            if b"NoSuchCoverage" in detail and coverage in WMS_LAYERS:
+                _WMS_FALLBACKS.add(coverage)
+                print(f"{coverage}: WCS coverage unavailable; using WMS raster fallback", flush=True)
+                return wms_get(coverage, when, lat, lon, scale, deadline)
             if exc.code in (404, 500) and b"ExceptionReport" in detail:
                 raise WcsMissing(f"{coverage} {when:%H:%M}: HTTP {exc.code}") from exc
             error = exc
@@ -640,6 +670,116 @@ def wcs_get(
                 break
         time.sleep(delay)
     raise RuntimeError(f"WCS request failed for {coverage}: {error}")
+
+
+def wms_time_bounds(deadline: float | None) -> dict[str, tuple[dt.datetime, dt.datetime]]:
+    """Bound WMS requests to advertised times; never silently use a newer scan.
+
+    EUMETView enables nearest-time matching. Visible products can stop updating
+    overnight while IR continues, so asking past the advertised end is unsafe.
+    Refresh the catalogue once a minute, including in multi-frame publishers.
+    """
+    global _WMS_TIMES, _WMS_TIMES_AT
+    if time.monotonic() - _WMS_TIMES_AT < 60:
+        return _WMS_TIMES
+    timeout = 30.0 if deadline is None else min(30.0, deadline - time.monotonic())
+    if timeout <= 0:
+        raise RuntimeError("WMS download deadline exceeded")
+    url = WMS_URL + "?service=WMS&version=1.3.0&request=GetCapabilities"
+    request = urllib.request.Request(url, headers={"User-Agent": WCS_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        root = ET.fromstring(response.read())
+    ns = {"w": "http://www.opengis.net/wms"}
+    bounds = {}
+    for layer in root.findall(".//w:Layer", ns):
+        name = layer.findtext("w:Name", namespaces=ns)
+        for dimension in layer.findall("w:Dimension", ns):
+            if dimension.get("name") == "time" and dimension.text:
+                parts = dimension.text.strip().split("/")
+                if len(parts) == 3:
+                    bounds[name] = tuple(dt.datetime.fromisoformat(p.replace("Z", "+00:00"))
+                                         for p in parts[:2])
+    _WMS_TIMES, _WMS_TIMES_AT = bounds, time.monotonic()
+    return bounds
+
+
+def wms_get(
+    coverage: str, when: dt.datetime, lat: tuple[float, float], lon: tuple[float, float],
+    scale: float | None = None, deadline: float | None = None,
+) -> bytes:
+    """Fetch lossless raw-gray maps and return a nodata-preserving GeoTIFF.
+
+    Split large maps on one shared pixel grid so MSG stays at native resolution
+    without exceeding GetMap's rendering budget. A failed piece rejects the
+    entire request; the normal source/scan fallback policy remains in charge.
+    """
+    layer, step = WMS_LAYERS[coverage]
+    bounds = wms_time_bounds(deadline).get(layer)
+    if bounds is None or not bounds[0] <= when <= bounds[1]:
+        raise WmsTimeUnavailable(f"{coverage} {when:%H:%M}: outside WMS advertised times",
+                                 bounds[1] if bounds is not None else None)
+    width = max(1, round((lon[1] - lon[0]) / step * (scale if scale is not None else 1.0)))
+    height = max(1, round((lat[1] - lat[0]) / step * (scale if scale is not None else 1.0)))
+    dx, dy = (lon[1] - lon[0]) / width, (lat[1] - lat[0]) / height
+    canvas = np.zeros((height, width), np.uint8)
+    stamp = when.strftime("%Y-%m-%dT%H:%M:00.000Z")
+    for row in range(0, height, WMS_MAX_SIZE):
+        for col in range(0, width, WMS_MAX_SIZE):
+            h, w = min(WMS_MAX_SIZE, height - row), min(WMS_MAX_SIZE, width - col)
+            # WMS 1.3.0 EPSG:4326 has latitude first. A zero-length time
+            # interval selects only this scan rather than a nearest instant.
+            params = {
+                "service": "WMS", "version": "1.3.0", "request": "GetMap",
+                "layers": layer, "styles": "raster", "crs": "EPSG:4326",
+                "bbox": f"{lat[1] - (row + h) * dy:.9f},{lon[0] + col * dx:.9f},"
+                        f"{lat[1] - row * dy:.9f},{lon[0] + (col + w) * dx:.9f}",
+                "width": str(w), "height": str(h), "format": "image/png",
+                "transparent": "true", "time": f"{stamp}/{stamp}",
+                "interpolations": "nearest neighbor",
+            }
+            url = WMS_URL + "?" + urllib.parse.urlencode(params)
+            error = None
+            downloaded = False
+            for attempt in range(8):
+                timeout = 120.0 if deadline is None else min(120.0, deadline - time.monotonic())
+                if timeout <= 0:
+                    break
+                try:
+                    request = urllib.request.Request(url, headers={"User-Agent": WCS_USER_AGENT})
+                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                        body = response.read()
+                    if not body.startswith(b"\x89PNG\r\n\x1a\n"):
+                        raise RuntimeError(f"WMS returned non-PNG payload for {coverage}: {body[:200]!r}")
+                    with Image.open(io.BytesIO(body)) as image:
+                        if image.size != (w, h):
+                            raise RuntimeError(f"WMS returned wrong dimensions for {coverage}: {image.size}")
+                        rgba = np.asarray(image.convert("RGBA"))
+                    # Do not convert through luminance or the default IR style:
+                    # WCS uses band zero, which is our calibrated gray index.
+                    gray = np.where(rgba[..., 3] == 255, rgba[..., 0], 0).astype(np.uint8)
+                    canvas[row:row + h, col:col + w] = gray
+                    downloaded = True
+                    break
+                except Exception as exc:
+                    error = exc
+                delay = min(30.0, 2.0 * 1.6**attempt)
+                if deadline is not None:
+                    delay = min(delay, deadline - time.monotonic())
+                if delay <= 0:
+                    break
+                time.sleep(delay)
+            if not downloaded:
+                raise RuntimeError(f"WMS request failed for {coverage}: {error}")
+    output = io.BytesIO()
+    transform = (dx, 0.0, 0.0, lon[0], 0.0, -dy, 0.0, lat[1],
+                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    tags = TiffImagePlugin.ImageFileDirectory_v2()
+    tags[34264], tags.tagtype[34264] = transform, 12  # DOUBLE, even with integer box edges
+    tags[42113], tags.tagtype[42113] = "0.0", 2  # ASCII
+    tags[34735] = (1, 1, 2, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326)
+    tags.tagtype[34735] = 3  # SHORT
+    Image.fromarray(canvas).save(output, "TIFF", compression="tiff_deflate", tiffinfo=tags)
+    return output.getvalue()
 
 
 def decode_geotiff(body: bytes, band: int = 0) -> tuple[np.ndarray, float, float, float, float]:
@@ -726,11 +866,15 @@ def fetch_wcs_source(
     vis_lut = MTG_VIS_GRAY_LUT if name == "MTG" else VIS_GRAY_LUT
     started = perf_counter()
     base = when - dt.timedelta(minutes=when.minute % cadence)
+    infrared_fallback = None
+    visible_latest = None
     # IR and VIS requests are fetched concurrently.
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         for fallback in range(0, 31, cadence):
             attempt = base - dt.timedelta(minutes=fallback)
+            if visible_latest is not None and attempt > visible_latest:
+                continue
             vis_future = pool.submit(
                 fetch_wcs_coverage, name, vis_coverage, attempt, vis_lut, vis_scale, deadline
             )
@@ -751,6 +895,12 @@ def fetch_wcs_source(
                 # Retry both channels at the same earlier time. Combining a
                 # complete IR scan with partial VIS still produces rectangles.
                 print(f"{name} WCS VIS unavailable at {attempt:%H:%M}: {exc}", flush=True)
+                if infrared_fallback is None:
+                    infrared_fallback = (ir, attempt)
+                if isinstance(exc, WmsTimeUnavailable):
+                    if exc.latest is None or exc.latest < base - dt.timedelta(minutes=30):
+                        break
+                    visible_latest = exc.latest
                 continue
             except Exception as exc:
                 print(f"{name} WCS VIS unavailable at {attempt:%H:%M}: {exc}", flush=True)
@@ -764,6 +914,17 @@ def fetch_wcs_source(
             }
     finally:
         pool.shutdown(wait=True)
+    if infrared_fallback is not None:
+        # An unavailable VIS scan must not erase a complete, newer IR scan.
+        # This is common when the WMS visible product stops updating at night.
+        ir, attempt = infrared_fallback
+        return ir, None, {
+            "available": True,
+            "timestamp": attempt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "fallback_minutes": int((when - attempt).total_seconds() // 60),
+            "vis_available": False,
+            "fetch_seconds": round(perf_counter() - started, 1),
+        }
     return None, None, {"available": False, "fetch_seconds": round(perf_counter() - started, 1)}
 
 

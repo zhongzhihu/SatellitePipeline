@@ -216,6 +216,34 @@ class EmptyFrameTests(unittest.TestCase):
         store.upload_pack.assert_not_called()
         store.publish_manifest.assert_not_called()
 
+    def test_no_european_infrared_is_rejected_before_upload(self):
+        variants = [
+            [m.Source("G19", "GOES-19", -75.2, 0, ir=layer(100))],
+            [m.Source("MTG", "Meteosat MTG", 0, 0, vis=layer(100))],
+            [m.Source("FES", "Meteosat 0°", 0, 0, ir=layer(0))],
+            [m.Source("FES", "Meteosat 0°", 0, 0,
+                      ir=m.NativeLayer(np.full((20, 20), 100, np.uint8), None, -10, 10, 1, 1))],
+        ]
+        for sources in variants:
+            with self.subTest(sources=sources[0].name), tempfile.TemporaryDirectory() as directory:
+                store = Mock()
+                with patch.object(m, "acquire_sources", return_value=sources), \
+                        patch.object(m, "build_frame_pack", return_value={"tiles": 800, "coverage_fraction": .5}):
+                    with self.assertRaisesRegex(RuntimeError, "without European infrared coverage"):
+                        publisher.build_frame(store, WHEN, "offline", Path(directory), 50, 1)
+                store.upload_pack.assert_not_called()
+
+    def test_either_european_infrared_source_allows_publication_without_visible(self):
+        for name in ("FES", "MTG"):
+            with self.subTest(source=name), tempfile.TemporaryDirectory() as directory:
+                store = Mock()
+                store.upload_pack.return_value = 1024
+                source = m.Source(name, "Europe", 0, 0, ir=layer(100))
+                with patch.object(m, "acquire_sources", return_value=[source]), \
+                        patch.object(m, "build_frame_pack", return_value={"tiles": 800, "coverage_fraction": .8, "pack_bytes": 1024}):
+                    publisher.build_frame(store, WHEN, "offline", Path(directory), 50, 1)
+                store.upload_pack.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
