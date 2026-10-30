@@ -18,6 +18,8 @@ donfig==0.8.1.post1
 frozenlist==1.8.0
 fsspec==2026.9.0
 google-crc32c==1.9.0
+h5py==3.16.0
+hdf5plugin==7.1.0
 idna==3.20
 jmespath==1.1.0
 locket==1.0.0

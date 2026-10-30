@@ -45,7 +45,7 @@ def source_summary(sources: list[mosaic.Source], stats: dict) -> dict:
     availability = {}
     for source in sources:
         entry = {"infrared": source.ir is not None, "visible": source.vis is not None}
-        for key in ("timestamp", "fallback_minutes"):
+        for key in ("timestamp", "fallback_minutes", "backend"):
             if key in source.info:
                 entry[key] = source.info[key]
         availability[source.label] = entry

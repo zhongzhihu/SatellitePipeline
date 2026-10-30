@@ -11,12 +11,17 @@ on:
         type: boolean
         required: false
         default: false
+      check_eumetsat_only:
+        description: Check EUMETSAT downloads without publishing or scheduling a continuation
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: satellite-publish
+  group: ${{ inputs.check_eumetsat_only && 'satellite-eumetsat-check' || 'satellite-publish' }}
   cancel-in-progress: false
 
 jobs:
@@ -30,6 +35,8 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      EUMETSAT_CONSUMER_KEY: ${{ secrets.EUMETSAT_CONSUMER_KEY }}
+      EUMETSAT_CONSUMER_SECRET: ${{ secrets.EUMETSAT_CONSUMER_SECRET }}
       SATELLITE_STORAGE_PREFIX: ${{ vars.SATELLITE_STORAGE_PREFIX }}
       SATELLITE_FRAME_COUNT: "1"
       SATELLITE_BOOTSTRAP_LOOKBACK_MINUTES: "180"
@@ -39,6 +46,7 @@ jobs:
       SATELLITE_AVIF_QUALITY: "50"
       SATELLITE_RENDER_WORKERS: "4"
       SATELLITE_WCS_DEADLINE_SECONDS: "300"
+      SATELLITE_EUMETSAT_DEADLINE_SECONDS: "480"
     steps:
       - name: Record run start
         id: start
@@ -50,6 +58,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.lock
       - name: Check publisher settings
+        if: ${{ !inputs.check_eumetsat_only }}
         run: |
           test -n "$R2_ACCOUNT_ID" || { echo "R2_ACCOUNT_ID secret is required"; exit 1; }
           test -n "$R2_BUCKET_NAME" || { echo "R2_BUCKET_NAME secret is required"; exit 1; }
@@ -58,13 +67,20 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.lock
       - name: Build and publish
+        if: ${{ !inputs.check_eumetsat_only }}
         env:
           SATELLITE_RUNTIME_DIR: ${{ runner.temp }}/satellite-pipeline
         run: python publish_live.py
 
+      - name: Check EUMETSAT downloads and decoding
+        if: ${{ inputs.check_eumetsat_only }}
+        env:
+          SATELLITE_RUNTIME_DIR: ${{ runner.temp }}/satellite-pipeline
+        run: python check_eumetsat.py
+
   continue:
     needs: publish
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && !inputs.check_eumetsat_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:

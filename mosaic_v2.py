@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image, TiffImagePlugin
 
 import pipeline_support as support
+import eumetsat_store as eumetsat
 
 UTC = dt.timezone.utc
 TILE_SIZE = 1024
@@ -531,6 +532,15 @@ NATIVE_CHANNELS = {
 }
 
 
+def configure_fci_decompression() -> None:
+    """Make the FCI filter available to both h5py and the NetCDF HDF5 library."""
+    import hdf5plugin
+
+    paths = os.environ.get("HDF5_PLUGIN_PATH", "").split(os.pathsep)
+    if hdf5plugin.PLUGINS_PATH not in paths:
+        os.environ["HDF5_PLUGIN_PATH"] = os.pathsep.join([hdf5plugin.PLUGINS_PATH] + [p for p in paths if p])
+
+
 def load_native_layers(when: dt.datetime) -> dict[tuple[str, str], tuple[NativeLayer, dict]]:
     """Download and decode the GOES and Himawari channels for ``when``.
 
@@ -563,40 +573,62 @@ def load_native_layers(when: dt.datetime) -> dict[tuple[str, str], tuple[NativeL
     return layers
 
 
-def load_native_layer(paths: list[str], reader: str, dataset: str, kind: str) -> tuple[NativeLayer, dict]:
+def load_native_layer(paths: list[str], reader: str, dataset: str, kind: str,
+                      stride: int = 1) -> tuple[NativeLayer, dict]:
     from satpy import Scene
 
     started = perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
+        if reader == "fci_l1c_nc":
+            configure_fci_decompression()
         scene = Scene(filenames=paths, reader=reader)
-        scene.load([dataset])
+        if reader in ("fci_l1c_nc", "seviri_l1b_native"):
+            # Meteosat data is stored south-up; the renderer expects north-up.
+            scene.load([dataset], upper_right_corner="NE")
+        else:
+            scene.load([dataset])
         data = scene[dataset]
-        values = np.asarray(data.values, dtype=np.float32)
-    area = data.attrs["area"]
-    if kind == "ir":
-        codes = ir_code(values)
-    else:
-        # Satpy reports reflectance factor in percent.
-        codes = reflectance_code(values / 100.0)
+        area = data.attrs["area"]
+        original_shape = data.shape
+        if reader == "fci_l1c_nc":
+            # Map to uint8 before materialising the 11k/22k-wide full disk.
+            # Limit parallel blocks so the hosted runner does not need several
+            # full floating-point copies of the 500 m visible channel in RAM.
+            import dask.array as da
+            array = data.data[::stride, ::stride]
+            if kind == "ir":
+                encoded = da.map_blocks(ir_code, array, dtype=np.uint8)
+            else:
+                encoded = da.map_blocks(lambda block: reflectance_code(block / 100.0), array, dtype=np.uint8)
+            codes = np.asarray(encoded.compute(num_workers=2), dtype=np.uint8)
+        else:
+            values = np.asarray(data.values, dtype=np.float32)[::stride, ::stride]
+            # Satpy reports visible reflectance factor in percent.
+            codes = ir_code(values) if kind == "ir" else reflectance_code(values / 100.0)
+            del values
     x0, _, _, y1 = area.area_extent
+    # Striding takes the first pixel of each group. Shift the outer corner so
+    # each retained sample keeps its original geolocation.
+    shift = (stride - 1) / 2.0
     layer = NativeLayer(
-        codes=codes,
+        codes=np.ascontiguousarray(codes),
         geos=Geos.from_crs(area.crs),
-        x0=float(x0),
-        y0=float(y1),
-        dx=float(area.pixel_size_x),
-        dy=float(area.pixel_size_y),
+        x0=float(x0 - shift * area.pixel_size_x),
+        y0=float(y1 + shift * area.pixel_size_y),
+        dx=float(area.pixel_size_x * stride),
+        dy=float(area.pixel_size_y * stride),
     )
     info = {
         "dataset": dataset,
-        "native_shape": list(values.shape),
+        "native_shape": list(original_shape),
+        "sample_stride": stride,
         "files": len(paths),
         "start_time": str(data.attrs.get("start_time", "")),
         "valid_fraction": round(float((codes > 0).mean()), 4),
         "load_seconds": round(perf_counter() - started, 2),
     }
-    del scene, data, values
+    del scene, data
     gc.collect()
     return layer, info
 
@@ -806,6 +838,7 @@ WCS_SOURCES = {
 # Incomplete MTG coverages are rejected: filling individual chunks from MSG
 # creates rectangular seams because the products have different radiometry.
 WCS_DEADLINE_SECONDS = float(os.environ.get("SATELLITE_WCS_DEADLINE_SECONDS", "330"))
+DATA_STORE_DEADLINE_SECONDS = float(os.environ.get("SATELLITE_EUMETSAT_DEADLINE_SECONDS", "480"))
 WCS_IR_LUTS = {"MTG": anchor_lut(MTG_IR_ANCHORS), "IODC": anchor_lut(IODC_IR_ANCHORS), "FES": anchor_lut(FES_IR_ANCHORS)}
 
 
@@ -928,22 +961,101 @@ def fetch_wcs_source(
     return None, None, {"available": False, "fetch_seconds": round(perf_counter() - started, 1)}
 
 
+def download_store_source(name: str, when: dt.datetime, store: eumetsat.DataStore) -> tuple | None:
+    """Download a complete recent scan, retrying an older product if needed."""
+    started = perf_counter()
+    deadline = time.monotonic() + DATA_STORE_DEADLINE_SECONDS
+    try:
+        for product in store.search(name, when, deadline):
+            try:
+                paths = store.download(product, deadline)
+                return product, paths, round(perf_counter() - started, 1)
+            except eumetsat.StoreAuthError:
+                raise
+            except Exception as exc:
+                print(f"{name} Data Store scan {product.timestamp:%H:%M} failed: {exc}", flush=True)
+                if time.monotonic() >= deadline:
+                    break
+        print(f"{name} Data Store: no complete usable scan in the allowed time window", flush=True)
+    except Exception as exc:
+        print(f"{name} Data Store unavailable: {exc}", flush=True)
+    return None
+
+
+def decode_store_source(name: str, when: dt.datetime, download: tuple) -> tuple:
+    product, paths, fetch_seconds = download
+    reader, ir_dataset, vis_dataset, vis_stride = (
+        ("fci_l1c_nc", "ir_105", "vis_06", 2) if name == "MTG"
+        else ("seviri_l1b_native", "IR_108", "VIS006", 1)
+    )
+    # IR is essential for publication; visible data can be absent at night.
+    ir, ir_info = load_native_layer(paths, reader, ir_dataset, "ir")
+    if not np.any(ir.codes):
+        raise RuntimeError(f"{name} Data Store infrared contains no valid pixels")
+    vis = None
+    vis_info = None
+    try:
+        vis, vis_info = load_native_layer(paths, reader, vis_dataset, "vis", stride=vis_stride)
+        if not np.any(vis.codes):
+            vis, vis_info = None, None
+    except Exception as exc:
+        print(f"{name} Data Store visible decode failed: {exc}", flush=True)
+    return ir, vis, {
+        "available": True,
+        "backend": "EUMETSAT Data Store",
+        "product_id": product.product_id,
+        "timestamp": product.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "fallback_minutes": int((when - product.timestamp).total_seconds() // 60),
+        "vis_available": vis is not None,
+        "fetch_seconds": fetch_seconds,
+        "ir": ir_info,
+        "vis": vis_info,
+    }
+
+
+def fetch_view_sources(names: list[str], when: dt.datetime) -> dict[str, tuple]:
+    """Give each EUMETView source its own deadline and start MTG promptly."""
+    def fetch(name: str) -> tuple:
+        result = fetch_wcs_source(name, when, time.monotonic() + WCS_DEADLINE_SECONDS)
+        result[2]["backend"] = "EUMETView"
+        print(f"{name}: {result[2]}", flush=True)
+        return result
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(names)) as pool:
+        futures = {pool.submit(fetch, name): name for name in names}
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                print(f"{name} EUMETView failed: {exc}", flush=True)
+    return results
+
+
 def acquire_sources(when: dt.datetime, include_wcs: bool = True) -> list[Source]:
     """Download and decode every source for ``when`` into native code layers."""
-    wcs_results: dict[str, tuple] = {}
-    wcs_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    wcs_future = None
+    meteosat_results: dict[str, tuple] = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    downloads = {}
+    view_future = None
     if include_wcs:
-        # EUMETView throttles aggressively; fetch its products serially in the
-        # background while NOAA inputs download and decode.
-        deadline = time.monotonic() + WCS_DEADLINE_SECONDS
-
-        def fetch_all() -> None:
-            # Meteosat 0° first: it is small and backs up every MTG chunk.
-            for name in ("FES", "IODC", "MTG"):
-                wcs_results[name] = fetch_wcs_source(name, when, deadline)
-                print(f"{name}: {wcs_results[name][2]}", flush=True)
-        wcs_future = wcs_pool.submit(fetch_all)
+        credentials = eumetsat.credentials_from_environment()
+        if credentials:
+            try:
+                # Set the plugin path before Satpy/NetCDF are imported by any
+                # source; their HDF5 library may be separate from h5py's.
+                configure_fci_decompression()
+            except ImportError as exc:
+                print(f"FCI decompression plugin unavailable: {exc}", flush=True)
+            store = eumetsat.DataStore(credentials)
+            # Download both archives in parallel with NOAA; decoding is done
+            # afterwards, one image at a time, to limit HDF5 and memory pressure.
+            downloads = {name: pool.submit(download_store_source, name, when, store)
+                         for name in ("MTG", "IODC")}
+        else:
+            print("EUMETSAT Data Store credentials not configured; using EUMETView", flush=True)
+            view_future = pool.submit(fetch_view_sources, ["MTG", "IODC", "FES"], when)
 
     layers = load_native_layers(when)
     sources = [
@@ -957,14 +1069,29 @@ def acquire_sources(when: dt.datetime, include_wcs: bool = True) -> list[Source]
         setattr(by_name[sat], kind, layer)
         by_name[sat].info[kind] = info
 
-    if wcs_future is not None:
-        wcs_future.result()
-    wcs_pool.shutdown()
+    if view_future is not None:
+        meteosat_results.update(view_future.result())
+    for name, future in downloads.items():
+        download = future.result()
+        if download is not None:
+            try:
+                meteosat_results[name] = decode_store_source(name, when, download)
+                print(f"{name}: {meteosat_results[name][2]}", flush=True)
+            except Exception as exc:
+                print(f"{name} Data Store decode failed: {exc}", flush=True)
+    if downloads:
+        missing = [name for name in ("MTG", "IODC") if name not in meteosat_results]
+        if "MTG" in missing:
+            missing.append("FES")
+        if missing:
+            print(f"Trying EUMETView fallback for {', '.join(missing)}", flush=True)
+            meteosat_results.update(fetch_view_sources(missing, when))
+    pool.shutdown(wait=True)
     labels = {"MTG": ("Meteosat MTG", 0.0, 0.0), "IODC": ("Meteosat IODC", 45.5, -0.15), "FES": ("Meteosat 0°", 0.0, -0.1)}
     for name, (label, lon, penalty) in labels.items():
-        if name not in wcs_results:
+        if name not in meteosat_results:
             continue
-        ir, vis, info = wcs_results[name]
+        ir, vis, info = meteosat_results[name]
         scan_time = (dt.datetime.strptime(info["timestamp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
                      if "timestamp" in info else when)
         sources.append(Source(name, label, lon, penalty, ir=ir, vis=vis, info=info, time=scan_time))
