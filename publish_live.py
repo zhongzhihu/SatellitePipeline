@@ -227,7 +227,7 @@ def main() -> None:
     quality = int(os.environ.get("SATELLITE_AVIF_QUALITY", str(DEFAULT_AVIF_QUALITY)))
     workers = int(os.environ.get("SATELLITE_RENDER_WORKERS", str(max(1, min(8, os.cpu_count() or 4)))))
     if count < 1 or count > MAX_FRAME_COUNT:
-        raise ValueError("SATELLITE_FRAME_COUNT must be between 1 and 6")
+        raise ValueError(f"SATELLITE_FRAME_COUNT must be between 1 and {MAX_FRAME_COUNT}")
     if bootstrap_lookback < 10 or bootstrap_lookback % 10:
         raise ValueError("SATELLITE_BOOTSTRAP_LOOKBACK_MINUTES must be a positive 10-minute multiple")
     if max_wait < 0:

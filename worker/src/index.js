@@ -184,10 +184,13 @@ async function clientV2Manifest(request, env, ctx) {
     return json({ error: "Satellite observations are not published" }, 503);
   }
   const expires = Math.floor(Date.now() / 3_600_000) * 3600 + 2 * 3600;
-  const origin = new URL(request.url).origin;
+  const requestURL = new URL(request.url);
+  const origin = requestURL.origin;
+  // Shipped clients reject manifests with more than six frames.
+  const frames = requestURL.searchParams.get("history") === "13" ? manifest.frames : manifest.frames.slice(-6);
   return json({
     ...manifest,
-    frames: await Promise.all(manifest.frames.map(async (frame) => ({
+    frames: await Promise.all(frames.map(async (frame) => ({
       ...frame,
       tile_url_template: `${origin}/v2/tiles/${frame.id}/${frame.pack}/{z}/{x}/{y}.avif?exp=${expires}&sig=${await v2TileSignature(env, frame.id, frame.pack, expires)}`,
     }))),

@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 
 FRAME_STEP = timedelta(minutes=10)
-MAX_FRAME_COUNT = 6
+MAX_FRAME_COUNT = 13
 
 
 def frame_window(newest: datetime, count: int = MAX_FRAME_COUNT) -> list[datetime]:
@@ -19,7 +19,7 @@ def frame_window(newest: datetime, count: int = MAX_FRAME_COUNT) -> list[datetim
 
 
 def missing_frames(target: datetime, available: set[datetime]) -> list[datetime]:
-    """Return missing frame times in the six-frame window ending at ``target``."""
+    """Return missing frame times in the maximum window ending at ``target``."""
     return [when for when in frame_window(target) if when not in available]
 
 

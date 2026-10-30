@@ -82,3 +82,19 @@ test('client manifest is read from R2 once and then served from the colo cache',
   assert.deepEqual(reads, ['manifest.json']);
   delete globalThis.caches;
 });
+
+test('long history requires opt-in and preserves the latest six for existing clients', async () => {
+  const store = memoryCache(), pending = [];
+  const frames = Array.from({ length: 13 }, (_, i) => ({ id: String(i), pack: 'abc123' }));
+  const env = { SATELLITE_CLIENT_AUTH_SECRET: 'client', SATELLITE_TILE_SIGNING_SECRET: 's', SATELLITE_BUCKET: {
+    async get() { return { text: async () => JSON.stringify({ frames }) }; },
+  } };
+  const ctx = { waitUntil(promise) { pending.push(promise); } };
+  for (const [query, expected] of [['', frames.slice(-6)], ['?history=13', frames]]) {
+    const response = await worker.fetch(new Request(`https://example.com/v2/client-manifest${query}`, { headers: { 'X-Client-Auth': 'client' } }), env, ctx);
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).frames.map(frame => frame.id), expected.map(frame => frame.id));
+    await Promise.all(pending);
+  }
+  delete globalThis.caches;
+});

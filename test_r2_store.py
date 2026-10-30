@@ -6,7 +6,7 @@ import unittest
 
 from botocore.exceptions import ClientError
 
-from frame_schedule import validate_timeline
+from frame_schedule import frame_window, publishable_window, validate_timeline
 from r2_store import ManifestConflict, R2Store
 
 UTC = dt.timezone.utc
@@ -110,6 +110,17 @@ class R2StoreTests(unittest.TestCase):
 
 
 class TimelineValidationTests(unittest.TestCase):
+    def test_two_hour_window_rolls_and_validates(self):
+        newest = dt.datetime(2026, 10, 4, 22, 0, tzinfo=UTC)
+        times = frame_window(newest)
+        self.assertEqual(len(times), 13)
+        self.assertEqual(times[-1] - times[0], dt.timedelta(hours=2))
+        validate_timeline([frame(t.strftime("%Y-%m-%dT%H:%M")) for t in times])
+        later = newest + dt.timedelta(minutes=10)
+        self.assertEqual(publishable_window(set(times + [later]), newest), times[1:] + [later])
+        with self.assertRaises(ValueError):
+            validate_timeline([frame(t.strftime("%Y-%m-%dT%H:%M")) for t in times + [later]])
+
     def test_consecutive_frames_are_accepted(self):
         validate_timeline([frame("2026-10-04T22:00"), frame("2026-10-04T22:10")])
 
