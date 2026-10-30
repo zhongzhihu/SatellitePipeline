@@ -4,6 +4,7 @@ import concurrent.futures
 import datetime as dt
 import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -47,6 +48,7 @@ def main() -> int:
                     raise RuntimeError("European infrared coverage check failed")
         except Exception as exc:
             print(f"{name}: decode/coverage check failed: {exc}", flush=True)
+            traceback.print_exc()
             ok = False
     return 0 if ok else 1
 

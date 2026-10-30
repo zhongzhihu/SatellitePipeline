@@ -199,8 +199,11 @@ class PipelineTests(unittest.TestCase):
         data = xr.DataArray(da.from_array(values, chunks=(2, 2)), dims=("y", "x"), attrs={"area": area})
         # MagicMock supports Satpy's subscript access.
         from unittest.mock import MagicMock
+        import dask
         scene = MagicMock()
         scene.__getitem__.return_value = data
+        scene.load.side_effect = lambda *args, **kwargs: self.assertEqual(
+            dask.config.get("scheduler"), "synchronous")
         with patch("satpy.Scene", return_value=scene), patch.object(mosaic, "configure_fci_decompression"):
             layer, info = mosaic.load_native_layer(["synthetic.nc"], "fci_l1c_nc", "vis_06", "vis", stride=2)
         scene.load.assert_called_once_with(["vis_06"], upper_right_corner="NE")

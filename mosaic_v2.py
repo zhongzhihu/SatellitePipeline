@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import dataclasses
 import datetime as dt
 import gc
@@ -578,7 +579,15 @@ def load_native_layer(paths: list[str], reader: str, dataset: str, kind: str,
     from satpy import Scene
 
     started = perf_counter()
-    with warnings.catch_warnings():
+    if reader == "fci_l1c_nc":
+        import dask
+        scheduler = dask.config.set(scheduler="synchronous")
+    else:
+        scheduler = contextlib.nullcontext()
+    # Satpy also computes metadata while constructing the scene and loading
+    # channels. Keep the whole FCI read single-threaded, not just the final
+    # array compute: common NetCDF/HDF5 builds are not thread-safe.
+    with scheduler, warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if reader == "fci_l1c_nc":
             configure_fci_decompression()
@@ -593,15 +602,15 @@ def load_native_layer(paths: list[str], reader: str, dataset: str, kind: str,
         original_shape = data.shape
         if reader == "fci_l1c_nc":
             # Map to uint8 before materialising the 11k/22k-wide full disk.
-            # Limit parallel blocks so the hosted runner does not need several
-            # full floating-point copies of the 500 m visible channel in RAM.
+            # Compute one block at a time to avoid concurrent NetCDF reads and
+            # multiple full floating-point copies on the hosted runner.
             import dask.array as da
             array = data.data[::stride, ::stride]
             if kind == "ir":
                 encoded = da.map_blocks(ir_code, array, dtype=np.uint8)
             else:
                 encoded = da.map_blocks(lambda block: reflectance_code(block / 100.0), array, dtype=np.uint8)
-            codes = np.asarray(encoded.compute(num_workers=2), dtype=np.uint8)
+            codes = np.asarray(encoded.compute(), dtype=np.uint8)
         else:
             values = np.asarray(data.values, dtype=np.float32)[::stride, ::stride]
             # Satpy reports visible reflectance factor in percent.
